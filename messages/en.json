@@ -1,0 +1,17 @@
+{
+  "LoginPage": {
+    "titleAccept": "Sign in to accept",
+    "titleWelcome": "Welcome back",
+    "descAccept": "Sign in and we'll take you to the invitation.",
+    "descWelcome": "Sign in to your account",
+    "emailLabel": "Email",
+    "emailPlaceholder": "you@example.com",
+    "passwordLabel": "Password",
+    "forgotPassword": "Forgot password?",
+    "passwordPlaceholder": "Enter your password",
+    "signingIn": "Signing in...",
+    "signIn": "Sign in",
+    "noAccount": "Don't have an account?",
+    "createAccount": "Create account"
+  }
+}
