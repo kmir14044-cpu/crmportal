@@ -340,6 +340,17 @@ export interface Deal {
   contact?: Contact;
   stage?: PipelineStage;
   assignee?: Profile;
+  lead_source?: string;
+  lead_destination?: string;
+  lead_trip_start_date?: string;
+  lead_starting_city?: string;
+  lead_days?: number | null;
+  lead_hotel_category?: string;
+  lead_adults?: number | null;
+  lead_children?: number | null;
+  lead_rooms?: number | null;
+  lead_transport?: string;
+  lead_query?: string;
 }
 
 export type BroadcastStatus = 'draft' | 'scheduled' | 'sending' | 'sent' | 'failed';
