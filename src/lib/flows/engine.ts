@@ -40,6 +40,7 @@ import {
   engineSendText,
 } from "./meta-send";
 import { decideFallback, resolveFallbackPolicy } from "./fallback";
+import { quoteTrip } from "@/lib/trip-planner/quote";
 import {
   type CollectInputNodeConfig,
   type ConditionNodeConfig,
@@ -644,6 +645,11 @@ function firstVar(vars: Record<string, unknown>, keys: string[]): string {
   return "";
 }
 
+function optionalInt(value: string): number | null {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function envValue(name: string): string {
   return process.env[name]?.trim() ?? "";
 }
@@ -691,6 +697,12 @@ function buildTripDesignerDetails(args: {
 async function submitTripDesignerQuote(
   details: TripDesignerDetails,
 ): Promise<TripDesignerQuote | null> {
+  try {
+    return quoteTrip(details);
+  } catch (err) {
+    console.error("[flows] local trip designer quote failed:", err);
+  }
+
   const quoteUrl = envValue("TDP_TRIP_PLANNER_QUOTE_URL");
   if (!quoteUrl) return null;
 
@@ -1029,6 +1041,22 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
       .filter(Boolean)
       .join("\n");
 
+    const leadDetailsPatch = hasTripDesignerDetails
+      ? {
+          lead_source: "Trip Designer",
+          lead_destination: destination || null,
+          lead_trip_start_date: tripStartDate || null,
+          lead_starting_city: startingCity || null,
+          lead_days: optionalInt(numberOfDays),
+          lead_hotel_category: hotelCategory || null,
+          lead_adults: optionalInt(adults),
+          lead_children: optionalInt(children),
+          lead_rooms: optionalInt(rooms),
+          lead_transport: transportType || null,
+          lead_query: query || null,
+        }
+      : {};
+
     if (existingDeal?.id) {
       await db
         .from("deals")
@@ -1036,6 +1064,7 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
           title,
           conversation_id: run.conversation_id,
           notes,
+          ...leadDetailsPatch,
           updated_at: new Date().toISOString(),
         })
         .eq("id", existingDeal.id)
@@ -1059,6 +1088,7 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
           ? "PKR"
           : (acct as { default_currency?: string } | null)?.default_currency ?? "USD",
         notes,
+        ...leadDetailsPatch,
         status: "open",
       });
     }

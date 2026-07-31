@@ -333,13 +333,6 @@ export interface Deal {
   value: number;
   currency?: string;
   notes?: string;
-  expected_close_date?: string;
-  status?: DealStatus;
-  created_at: string;
-  updated_at?: string;
-  contact?: Contact;
-  stage?: PipelineStage;
-  assignee?: Profile;
   lead_source?: string;
   lead_destination?: string;
   lead_trip_start_date?: string;
@@ -351,6 +344,13 @@ export interface Deal {
   lead_rooms?: number | null;
   lead_transport?: string;
   lead_query?: string;
+  expected_close_date?: string;
+  status?: DealStatus;
+  created_at: string;
+  updated_at?: string;
+  contact?: Contact;
+  stage?: PipelineStage;
+  assignee?: Profile;
 }
 
 export type BroadcastStatus = 'draft' | 'scheduled' | 'sending' | 'sent' | 'failed';
