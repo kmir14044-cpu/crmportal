@@ -81,6 +81,10 @@ export interface UmrahQuoteResult {
   }>
   transportSectors: Array<{ sector: string; label: string; amount: number }>
   ziyarats: Array<{ id: string; name: string; amount: number }>
+  itinerary: Array<{
+    title: string
+    details: string[]
+  }>
   summary: string
   whatsappText: string
 }
@@ -110,8 +114,8 @@ function money(value: number): string {
 
 function category(value: unknown): string {
   const key = norm(value)
-  if (['budget', 'economy', 'normal'].includes(key)) return 'Economy'
-  if (['standard', 'deluxe', 'premium'].includes(key)) return 'Standard'
+  if (['budget', 'economy', 'normal', 'deluxe'].includes(key)) return 'Economy'
+  if (['standard', 'premium'].includes(key)) return 'Standard'
   if (['executive', 'luxury', 'vip', '5 star', '5-star'].includes(key)) return 'Executive'
   return String(value || 'Economy')
 }
@@ -338,7 +342,7 @@ export function quoteUmrah(input: UmrahQuoteInput, data: JsonRecord = defaultDat
   const ziyarats = (input.include_ziyarat ? selectedZiyaratIds : [])
     .map((id) => {
       const source = rows(data, 'ziyarats').find((item) => item.id === id)
-      const fallbackName = id === 'madina' ? 'Madina Ziyarat' : `${id} Ziyarat`
+      const fallbackName = id === 'madina' ? 'Madina Ziyarat' : id === 'makkah' ? 'Makkah Ziyarat' : `${id} Ziyarat`
       const amountSar = numberValue(source?.price ?? source?.price_sar, id === 'madina' ? 1200 : 250)
       return { id, name: String(source?.name ?? fallbackName), amount: sarToPkr(data, amountSar) }
     })
@@ -353,10 +357,29 @@ export function quoteUmrah(input: UmrahQuoteInput, data: JsonRecord = defaultDat
   const route = sequence.join(' -> ').replace(/Madinah/g, 'Madina')
   const hasMissingRates = hotelLines.some((line) => line.hasMissingRates)
   const summary = `${intValue(input.nights, 0)} nights ${route} Umrah package for ${adults + children} travelers, ${roomsCount} ${roomType} room(s), ${vehicle} transport.`
+  const itinerary = hotelLines.map((line, index) => ({
+    title: `Stop ${index + 1}: ${line.city}`,
+    details: [
+      `${line.nights} night${line.nights === 1 ? '' : 's'} stay from ${displayDate(line.checkIn)} to ${displayDate(line.checkOut)}`,
+      `Hotel: ${line.hotel}${line.category ? ` (${line.category})` : ''}`,
+      line.distance ? `Location/distance: ${line.distance}` : '',
+      line.meal ? `Meal plan: ${line.meal}` : '',
+      line.hasMissingRates ? 'Some hotel nights need manual rate confirmation.' : 'Hotel season rates included.',
+    ].filter(Boolean),
+  }))
+  if (ziyarats.length) {
+    itinerary.push({
+      title: 'Ziyarat tours',
+      details: ziyarats.map((item) => `${item.name} included`),
+    })
+  }
 
   const hotelText = hotelLines
     .map((line) => `- ${line.city}: ${line.hotel} (${line.nights} nights, ${displayDate(line.checkIn)} to ${displayDate(line.checkOut)})`)
     .join('\n')
+  const itineraryText = itinerary
+    .map((item) => `${item.title}\n${item.details.map((detail) => `- ${detail}`).join('\n')}`)
+    .join('\n\n')
   const whatsappText = [
     `Tours in Pakistan Umrah quotation`,
     ``,
@@ -370,6 +393,9 @@ export function quoteUmrah(input: UmrahQuoteInput, data: JsonRecord = defaultDat
     ``,
     `Hotels:`,
     hotelText,
+    ``,
+    `Itinerary:`,
+    itineraryText,
     ``,
     `Estimated total: ${money(total)}`,
     hasMissingRates ? `Some nights need manual rate confirmation before final booking.` : `Rates are based on available hotel season data.`,
@@ -401,6 +427,7 @@ export function quoteUmrah(input: UmrahQuoteInput, data: JsonRecord = defaultDat
     hotelLines,
     transportSectors,
     ziyarats,
+    itinerary,
     summary,
     whatsappText,
   }
