@@ -40,7 +40,8 @@ import {
   engineSendText,
 } from "./meta-send";
 import { decideFallback, resolveFallbackPolicy } from "./fallback";
-import { quoteTrip } from "@/lib/trip-planner/quote";
+import { loadTripPlannerDataForAccount, quoteTrip } from "@/lib/trip-planner/quote";
+import { loadUmrahPlannerDataForAccount, quoteUmrah } from "@/lib/umrah-planner/quote";
 import {
   type CollectInputNodeConfig,
   type ConditionNodeConfig,
@@ -87,6 +88,25 @@ export function matchReplyId(
     return null;
   }
   return null;
+}
+
+function interactiveVarPatch(
+  node: { node_type: string; config: Record<string, unknown> },
+  reply_id: string,
+): Record<string, string> {
+  if (node.node_type === "send_buttons") {
+    const cfg = node.config as unknown as SendButtonsNodeConfig;
+    const hit = cfg.buttons?.find((b) => b.reply_id === reply_id);
+    return hit?.var_key ? { [hit.var_key]: hit.value ?? hit.title ?? reply_id } : {};
+  }
+  if (node.node_type === "send_list") {
+    const cfg = node.config as unknown as SendListNodeConfig;
+    for (const section of cfg.sections ?? []) {
+      const hit = section.rows?.find((r) => r.reply_id === reply_id);
+      if (hit?.var_key) return { [hit.var_key]: hit.value ?? hit.title ?? reply_id };
+    }
+  }
+  return {};
 }
 
 function escapeRegExp(value: string): string {
@@ -276,6 +296,43 @@ interface TripDesignerQuote {
     hotel?: string;
   }>;
   lead?: { id?: number; saved?: boolean };
+}
+
+interface UmrahPlannerDetails {
+  name: string;
+  email: string;
+  phone: string;
+  start_date: string;
+  route_preset_id: string;
+  nights: string;
+  adults: string;
+  children: string;
+  infants: string;
+  rooms: string;
+  room_type: string;
+  hotel_category: string;
+  vehicle: string;
+  include_visa: boolean;
+  include_ziyarat: boolean;
+  query: string;
+}
+
+interface UmrahPlannerQuote {
+  ok?: boolean;
+  priceText?: string;
+  whatsappText?: string;
+  route?: string;
+  nights?: number;
+  hotelLines?: Array<{
+    city?: string;
+    nights?: number;
+    hotel?: string;
+    checkIn?: string;
+    checkOut?: string;
+    hasMissingRates?: boolean;
+  }>;
+  transportSectors?: Array<{ label?: string; amount?: number }>;
+  hasMissingRates?: boolean;
 }
 
 async function loadActiveRunForContact(
@@ -694,11 +751,67 @@ function buildTripDesignerDetails(args: {
   };
 }
 
+function boolFromVar(value: string, fallback = false): boolean {
+  if (!value) return fallback;
+  return ["yes", "true", "1", "include", "included", "with"].includes(value.trim().toLowerCase());
+}
+
+function routePresetFromValue(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (["madinah then makkah", "madina then makkah", "md-mk", "medina-makkah"].includes(normalized)) {
+    return "md-mk";
+  }
+  if (["makkah madinah makkah", "makkah madina makkah", "mk-md-mk"].includes(normalized)) {
+    return "mk-md-mk";
+  }
+  if (["madinah makkah madinah", "madina makkah madina", "md-mk-md"].includes(normalized)) {
+    return "md-mk-md";
+  }
+  return "mk-md";
+}
+
+function buildUmrahPlannerDetails(args: {
+  contact: Record<string, unknown> | null;
+  name: string;
+  email: string;
+  query: string;
+  vars: Record<string, unknown>;
+}): UmrahPlannerDetails {
+  const contactName =
+    typeof args.contact?.name === "string" ? args.contact.name.trim() : "";
+  const contactEmail =
+    typeof args.contact?.email === "string" ? args.contact.email.trim() : "";
+  const contactPhone =
+    typeof args.contact?.phone === "string" ? args.contact.phone.trim() : "";
+  const route = firstVar(args.vars, ["umrah_route", "route", "route_preset_id"]);
+
+  return {
+    name: args.name || contactName || "WhatsApp lead",
+    email: args.email || contactEmail,
+    phone: contactPhone,
+    start_date: firstVar(args.vars, ["umrah_start_date", "start_date", "travel_date"]),
+    route_preset_id: routePresetFromValue(route),
+    nights: firstVar(args.vars, ["umrah_nights", "nights", "number_of_nights", "days"]) || "6",
+    adults: firstVar(args.vars, ["umrah_adults", "adults"]) || "2",
+    children: firstVar(args.vars, ["umrah_children", "children"]) || "0",
+    infants: firstVar(args.vars, ["umrah_infants", "infants"]) || "0",
+    rooms: firstVar(args.vars, ["umrah_rooms", "rooms", "number_of_rooms"]) || "1",
+    room_type: firstVar(args.vars, ["umrah_room_type", "room_type"]) || "Double",
+    hotel_category: firstVar(args.vars, ["umrah_hotel_category", "hotel_category", "hotel"]) || "Economy",
+    vehicle: firstVar(args.vars, ["umrah_vehicle", "vehicle", "transport_type", "transport"]) || "Car",
+    include_visa: boolFromVar(firstVar(args.vars, ["umrah_include_visa", "include_visa"]), true),
+    include_ziyarat: boolFromVar(firstVar(args.vars, ["umrah_include_ziyarat", "include_ziyarat"]), false),
+    query: args.query || firstVar(args.vars, ["umrah_query", "query", "requirement"]),
+  };
+}
+
 async function submitTripDesignerQuote(
+  db: AdminClient,
+  accountId: string,
   details: TripDesignerDetails,
 ): Promise<TripDesignerQuote | null> {
   try {
-    return quoteTrip(details);
+    return quoteTrip(details, await loadTripPlannerDataForAccount(db, accountId));
   } catch (err) {
     console.error("[flows] local trip designer quote failed:", err);
   }
@@ -728,6 +841,39 @@ async function submitTripDesignerQuote(
     console.error("[flows] trip designer quote request failed:", err);
     return null;
   }
+}
+
+async function submitUmrahPlannerQuote(
+  db: AdminClient,
+  accountId: string,
+  details: UmrahPlannerDetails,
+): Promise<UmrahPlannerQuote | null> {
+  try {
+    return quoteUmrah(details, await loadUmrahPlannerDataForAccount(db, accountId));
+  } catch (err) {
+    console.error("[flows] local umrah planner quote failed:", err);
+    return null;
+  }
+}
+
+function formatUmrahPlannerNotes(quote: UmrahPlannerQuote | null): string {
+  if (!quote) return "";
+  const hotelLines = (quote.hotelLines ?? [])
+    .map((line) => `${line.city}: ${line.hotel} (${line.nights} nights, ${line.checkIn} to ${line.checkOut})`)
+    .join("\n");
+  const sectors = (quote.transportSectors ?? [])
+    .map((sector) => `${sector.label}: ${sector.amount ?? 0}`)
+    .join("\n");
+  return [
+    "Umrah Planner Result:",
+    quote.priceText ? `Estimated Price: ${quote.priceText}` : null,
+    quote.route ? `Route: ${quote.route}` : null,
+    hotelLines ? `Hotels:\n${hotelLines}` : null,
+    sectors ? `Transport:\n${sectors}` : null,
+    quote.hasMissingRates ? "Manual rate confirmation required for one or more hotel nights." : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function formatTripDesignerNotes(quote: TripDesignerQuote | null): string {
@@ -922,6 +1068,22 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
   const children = firstVar(run.vars, ["children"]);
   const rooms = firstVar(run.vars, ["rooms", "number_of_rooms"]);
   const transportType = firstVar(run.vars, ["transport_type", "transport"]);
+  const umrahStartDate = firstVar(run.vars, ["umrah_start_date"]);
+  const umrahNights = firstVar(run.vars, ["umrah_nights", "number_of_nights"]);
+  const umrahRoute = firstVar(run.vars, ["umrah_route", "route_preset_id"]);
+  const umrahVehicle = firstVar(run.vars, ["umrah_vehicle", "vehicle"]);
+  const umrahAdults = firstVar(run.vars, ["umrah_adults"]);
+  const umrahRooms = firstVar(run.vars, ["umrah_rooms"]);
+  const umrahHotelCategory = firstVar(run.vars, ["umrah_hotel_category"]);
+  const hasUmrahPlannerDetails = Boolean(
+    umrahStartDate &&
+      umrahNights &&
+      umrahRoute &&
+      umrahAdults &&
+      umrahRooms &&
+      umrahHotelCategory &&
+      umrahVehicle,
+  );
   const hasTripDesignerDetails = Boolean(
     tripStartDate ||
       startingCity ||
@@ -934,7 +1096,7 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
       transportType,
   );
 
-  if (!name && !email && !company && !query && !hasTripDesignerDetails) return;
+  if (!name && !email && !company && !query && !hasTripDesignerDetails && !hasUmrahPlannerDetails) return;
 
   try {
     const { data: contact } = await db
@@ -1002,12 +1164,25 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
         })
       : null;
     const tripDesignerQuote = tripDesignerDetails
-      ? await submitTripDesignerQuote(tripDesignerDetails)
+      ? await submitTripDesignerQuote(db, run.account_id, tripDesignerDetails)
       : null;
     const tripDesignerNotes = formatTripDesignerNotes(tripDesignerQuote);
+    const umrahPlannerDetails = hasUmrahPlannerDetails
+      ? buildUmrahPlannerDetails({
+          contact: (contact as Record<string, unknown> | null) ?? null,
+          name,
+          email,
+          query,
+          vars: run.vars,
+        })
+      : null;
+    const umrahPlannerQuote = umrahPlannerDetails
+      ? await submitUmrahPlannerQuote(db, run.account_id, umrahPlannerDetails)
+      : null;
+    const umrahPlannerNotes = formatUmrahPlannerNotes(umrahPlannerQuote);
 
     let existingDeal: { id: string } | undefined;
-    if (!hasTripDesignerDetails) {
+    if (!hasTripDesignerDetails && !hasUmrahPlannerDetails) {
       const { data: existingDeals } = await db
         .from("deals")
         .select("id")
@@ -1020,7 +1195,16 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
     }
 
     const titleName = name || company || destination || "WhatsApp lead";
-    const title = hasTripDesignerDetails
+    const title = hasUmrahPlannerDetails
+      ? [
+          "Umrah request",
+          umrahPlannerDetails?.route_preset_id?.toUpperCase() || "package",
+          umrahPlannerDetails?.nights ? `${umrahPlannerDetails.nights} nights` : null,
+          umrahPlannerDetails?.start_date || null,
+        ]
+          .filter(Boolean)
+          .join(" - ")
+      : hasTripDesignerDetails
       ? [
           "Trip request",
           destination || titleName,
@@ -1031,17 +1215,36 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
           .join(" - ")
       : `Lead from WhatsApp - ${titleName}`;
     const notes = [
+      hasUmrahPlannerDetails ? "Umrah package request - quote in PKR only." : null,
       hasTripDesignerDetails ? "Local Pakistan trip request - quote in PKR only." : null,
       tripDetails || null,
       query ? `Query: ${query}` : null,
       company ? `Business: ${company}` : null,
       email ? `Email: ${email}` : null,
       tripDesignerNotes || null,
+      umrahPlannerNotes || null,
     ]
       .filter(Boolean)
       .join("\n");
 
-    const leadDetailsPatch = hasTripDesignerDetails
+    const leadDetailsPatch = hasUmrahPlannerDetails && umrahPlannerDetails
+      ? {
+          lead_source: "Umrah Planner",
+          lead_destination: "Umrah",
+          lead_trip_start_date: umrahPlannerDetails.start_date || null,
+          lead_starting_city: "Pakistan",
+          lead_days: optionalInt(umrahPlannerDetails.nights),
+          lead_hotel_category: umrahPlannerDetails.hotel_category || null,
+          lead_adults: optionalInt(umrahPlannerDetails.adults),
+          lead_children: optionalInt(umrahPlannerDetails.children),
+          lead_rooms: optionalInt(umrahPlannerDetails.rooms),
+          lead_transport: umrahPlannerDetails.vehicle || null,
+          lead_query: [
+            `Route: ${umrahPlannerQuote?.route ?? umrahPlannerDetails.route_preset_id}`,
+            umrahPlannerDetails.query || null,
+          ].filter(Boolean).join("\n"),
+        }
+      : hasTripDesignerDetails
       ? {
           lead_source: "Trip Designer",
           lead_destination: destination || null,
@@ -1084,7 +1287,7 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
         conversation_id: run.conversation_id,
         title,
         value: 0,
-        currency: hasTripDesignerDetails
+        currency: hasTripDesignerDetails || hasUmrahPlannerDetails
           ? "PKR"
           : (acct as { default_currency?: string } | null)?.default_currency ?? "USD",
         notes,
@@ -1104,6 +1307,19 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
         });
       } catch (err) {
         console.error("[flows] trip designer WhatsApp reply failed:", err);
+      }
+    }
+    if (umrahPlannerQuote?.whatsappText) {
+      try {
+        await engineSendText({
+          accountId: run.account_id,
+          userId: run.user_id,
+          conversationId: run.conversation_id,
+          contactId: run.contact_id,
+          text: umrahPlannerQuote.whatsappText,
+        });
+      } catch (err) {
+        console.error("[flows] umrah planner WhatsApp reply failed:", err);
       }
     }
   } catch (err) {
@@ -1588,6 +1804,23 @@ async function handleReplyForActiveRun(
       currentNode.node_type === "send_list")
   ) {
     matched = matchReplyId(currentNode, message.reply_id);
+    if (matched) {
+      const patch = interactiveVarPatch(currentNode, message.reply_id);
+      if (Object.keys(patch).length) {
+        const newVars = { ...run.vars, ...patch };
+        const { error } = await db
+          .from("flow_runs")
+          .update({ vars: newVars, reprompt_count: 0 })
+          .eq("id", run.id);
+        if (!error) {
+          run.vars = newVars;
+          run.reprompt_count = 0;
+          await logEvent(db, run.id, "node_entered", currentNode.node_key, {
+            captured_keys: Object.keys(patch),
+          });
+        }
+      }
+    }
   } else if (
     message.kind === "text" &&
     currentNode.node_type === "collect_input"

@@ -45,6 +45,9 @@ export interface SendButtonsNodeConfig {
     reply_id: string;
     /** Visible label (≤ 20 chars per Meta). */
     title: string;
+    /** Optional: persist this selection into flow_runs.vars[var_key]. */
+    var_key?: string;
+    value?: string;
     /** node_key the runner advances to when this button is tapped. */
     next_node_key: string;
   }>;
@@ -63,6 +66,9 @@ export interface SendListNodeConfig {
       reply_id: string;
       title: string;
       description?: string;
+      /** Optional: persist this row selection into flow_runs.vars[var_key]. */
+      var_key?: string;
+      value?: string;
       next_node_key: string;
     }>;
   }>;
