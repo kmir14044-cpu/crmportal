@@ -728,10 +728,121 @@ function bulkValue(fields: Record<string, string>, labels: string[]): string {
   return "";
 }
 
+function nonEmptyBulkLines(text: string): string[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function isSkipValue(value: string | undefined): boolean {
+  return ["skip", "no", "none", "n/a", "na", "-"].includes(String(value ?? "").trim().toLowerCase());
+}
+
+function looksLikeDateValue(value: string | undefined): boolean {
+  return /^\d{4}-\d{1,2}-\d{1,2}$/.test(String(value ?? "").trim());
+}
+
+function parseOrderedTripDetails(text: string): Record<string, string> {
+  const lines = nonEmptyBulkLines(text);
+  if (lines.length < 9 || lines.some((line) => /[:=]/.test(line))) return {};
+  let index = 0;
+  let name = "";
+  let email = "";
+  if (!looksLikeDateValue(lines[index])) {
+    name = isSkipValue(lines[index]) ? "" : lines[index];
+    index += 1;
+  }
+  if (!looksLikeDateValue(lines[index])) {
+    email = isSkipValue(lines[index]) ? "" : lines[index];
+    index += 1;
+  }
+  const [
+    trip_start_date,
+    starting_city,
+    destination,
+    number_of_days,
+    adults,
+    children,
+    rooms,
+    hotel_category,
+    transport_type,
+    ...rest
+  ] = lines.slice(index);
+  if (!trip_start_date || !starting_city || !destination || !number_of_days || !hotel_category || !transport_type) {
+    return {};
+  }
+  return {
+    name,
+    email,
+    trip_start_date,
+    starting_city,
+    destination,
+    number_of_days,
+    adults,
+    children,
+    rooms,
+    hotel_category,
+    transport_type,
+    query: rest.join(" "),
+  };
+}
+
+function parseOrderedUmrahDetails(text: string): Record<string, string> {
+  const lines = nonEmptyBulkLines(text);
+  if (lines.length < 10 || lines.some((line) => /[:=]/.test(line))) return {};
+  let index = 0;
+  let name = "";
+  let email = "";
+  if (!looksLikeDateValue(lines[index])) {
+    name = isSkipValue(lines[index]) ? "" : lines[index];
+    index += 1;
+  }
+  if (!looksLikeDateValue(lines[index])) {
+    email = isSkipValue(lines[index]) ? "" : lines[index];
+    index += 1;
+  }
+  const [
+    umrah_start_date,
+    umrah_route,
+    umrah_nights,
+    umrah_adults,
+    umrah_children,
+    umrah_infants,
+    umrah_rooms,
+    umrah_room_type,
+    umrah_hotel_category,
+    umrah_vehicle,
+    umrah_include_ziyarat,
+    ...rest
+  ] = lines.slice(index);
+  if (!umrah_start_date || !umrah_route || !umrah_nights || !umrah_rooms || !umrah_room_type || !umrah_hotel_category || !umrah_vehicle) {
+    return {};
+  }
+  return {
+    name,
+    email,
+    umrah_start_date,
+    umrah_route,
+    umrah_nights,
+    umrah_adults,
+    umrah_children,
+    umrah_infants,
+    umrah_rooms,
+    umrah_room_type,
+    umrah_hotel_category,
+    umrah_vehicle,
+    umrah_include_ziyarat,
+    query: rest.join(" "),
+  };
+}
+
 function bulkDetailsLookComplete(text: string, kind: "bulk_trip" | "bulk_umrah"): boolean {
   const fields = parseBulkFields(text);
   if (kind === "bulk_trip") {
+    const ordered = parseOrderedTripDetails(text);
     return Boolean(
+      ordered.trip_start_date ||
       bulkValue(fields, ["date", "travel date", "trip date", "start date", "trip start date"]) &&
         bulkValue(fields, ["from", "starting city", "departure city", "city"]) &&
         bulkValue(fields, ["destination", "place", "tour", "package"]) &&
@@ -740,7 +851,9 @@ function bulkDetailsLookComplete(text: string, kind: "bulk_trip" | "bulk_umrah")
         bulkValue(fields, ["transport", "vehicle", "car"]),
     );
   }
+  const ordered = parseOrderedUmrahDetails(text);
   return Boolean(
+    ordered.umrah_start_date ||
     bulkValue(fields, ["date", "travel date", "start date", "umrah date", "departure date"]) &&
       bulkValue(fields, ["route", "umrah route"]) &&
       bulkValue(fields, ["nights", "total nights", "duration"]) &&
@@ -759,36 +872,38 @@ function varsFromBulkDetails(vars: Record<string, unknown>): Record<string, stri
 
   if (tripBulk || genericBulk) {
     const fields = parseBulkFields(tripBulk || genericBulk);
-    out.name = bulkValue(fields, ["name", "full name", "customer name"]);
-    out.email = bulkValue(fields, ["email", "email address"]);
-    out.trip_start_date = bulkValue(fields, ["date", "travel date", "trip date", "start date", "trip start date"]);
-    out.starting_city = bulkValue(fields, ["from", "starting city", "departure city", "city"]);
-    out.destination = bulkValue(fields, ["destination", "place", "tour", "package"]);
-    out.number_of_days = bulkValue(fields, ["days", "duration", "number of days"]);
-    out.hotel_category = bulkValue(fields, ["hotel", "hotel category", "category"]);
-    out.adults = bulkValue(fields, ["adults", "adult"]);
-    out.children = bulkValue(fields, ["children", "child"]);
-    out.rooms = bulkValue(fields, ["rooms", "room"]);
-    out.transport_type = bulkValue(fields, ["transport", "vehicle", "car"]);
-    out.query = bulkValue(fields, ["query", "requirement", "requirements", "special requirement", "notes"]);
+    const ordered = parseOrderedTripDetails(tripBulk || genericBulk);
+    out.name = bulkValue(fields, ["name", "full name", "customer name"]) || ordered.name;
+    out.email = bulkValue(fields, ["email", "email address"]) || ordered.email;
+    out.trip_start_date = bulkValue(fields, ["date", "travel date", "trip date", "start date", "trip start date"]) || ordered.trip_start_date;
+    out.starting_city = bulkValue(fields, ["from", "starting city", "departure city", "city"]) || ordered.starting_city;
+    out.destination = bulkValue(fields, ["destination", "place", "tour", "package"]) || ordered.destination;
+    out.number_of_days = bulkValue(fields, ["days", "duration", "number of days"]) || ordered.number_of_days;
+    out.hotel_category = bulkValue(fields, ["hotel", "hotel category", "category"]) || ordered.hotel_category;
+    out.adults = bulkValue(fields, ["adults", "adult"]) || ordered.adults;
+    out.children = bulkValue(fields, ["children", "child"]) || ordered.children;
+    out.rooms = bulkValue(fields, ["rooms", "room"]) || ordered.rooms;
+    out.transport_type = bulkValue(fields, ["transport", "vehicle", "car"]) || ordered.transport_type;
+    out.query = bulkValue(fields, ["query", "requirement", "requirements", "special requirement", "notes"]) || ordered.query;
   }
 
   if (umrahBulk || genericBulk) {
     const fields = parseBulkFields(umrahBulk || genericBulk);
-    out.name ||= bulkValue(fields, ["name", "full name", "customer name"]);
-    out.email ||= bulkValue(fields, ["email", "email address"]);
-    out.umrah_start_date = bulkValue(fields, ["date", "travel date", "start date", "umrah date", "departure date"]);
-    out.umrah_route = bulkValue(fields, ["route", "umrah route"]);
-    out.umrah_nights = bulkValue(fields, ["nights", "total nights", "duration"]);
-    out.umrah_adults = bulkValue(fields, ["adults", "adult"]);
-    out.umrah_children = bulkValue(fields, ["children", "child"]);
-    out.umrah_infants = bulkValue(fields, ["infants", "infant"]);
-    out.umrah_rooms = bulkValue(fields, ["rooms", "room"]);
-    out.umrah_room_type = bulkValue(fields, ["room type", "sharing", "room sharing"]);
-    out.umrah_hotel_category = bulkValue(fields, ["hotel category", "category", "hotel"]);
-    out.umrah_vehicle = bulkValue(fields, ["vehicle", "transport", "car"]);
-    out.umrah_include_ziyarat = bulkValue(fields, ["ziyarat", "ziyarats", "include ziyarat"]);
-    out.query ||= bulkValue(fields, ["query", "requirement", "requirements", "special requirement", "notes"]);
+    const ordered = parseOrderedUmrahDetails(umrahBulk || genericBulk);
+    out.name ||= bulkValue(fields, ["name", "full name", "customer name"]) || ordered.name;
+    out.email ||= bulkValue(fields, ["email", "email address"]) || ordered.email;
+    out.umrah_start_date = bulkValue(fields, ["date", "travel date", "start date", "umrah date", "departure date"]) || ordered.umrah_start_date;
+    out.umrah_route = bulkValue(fields, ["route", "umrah route"]) || ordered.umrah_route;
+    out.umrah_nights = bulkValue(fields, ["nights", "total nights", "duration"]) || ordered.umrah_nights;
+    out.umrah_adults = bulkValue(fields, ["adults", "adult"]) || ordered.umrah_adults;
+    out.umrah_children = bulkValue(fields, ["children", "child"]) || ordered.umrah_children;
+    out.umrah_infants = bulkValue(fields, ["infants", "infant"]) || ordered.umrah_infants;
+    out.umrah_rooms = bulkValue(fields, ["rooms", "room"]) || ordered.umrah_rooms;
+    out.umrah_room_type = bulkValue(fields, ["room type", "sharing", "room sharing"]) || ordered.umrah_room_type;
+    out.umrah_hotel_category = bulkValue(fields, ["hotel category", "category", "hotel"]) || ordered.umrah_hotel_category;
+    out.umrah_vehicle = bulkValue(fields, ["vehicle", "transport", "car"]) || ordered.umrah_vehicle;
+    out.umrah_include_ziyarat = bulkValue(fields, ["ziyarat", "ziyarats", "include ziyarat"]) || ordered.umrah_include_ziyarat;
+    out.query ||= bulkValue(fields, ["query", "requirement", "requirements", "special requirement", "notes"]) || ordered.query;
   }
 
   return Object.fromEntries(Object.entries(out).filter(([, value]) => value.trim()));
