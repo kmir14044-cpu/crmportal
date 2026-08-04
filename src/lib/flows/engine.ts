@@ -40,7 +40,7 @@ import {
   engineSendText,
 } from "./meta-send";
 import { decideFallback, resolveFallbackPolicy } from "./fallback";
-import { loadTripPlannerDataForAccount, quoteTrip } from "@/lib/trip-planner/quote";
+import { quoteTrip } from "@/lib/trip-planner/quote";
 import { loadUmrahPlannerDataForAccount, quoteUmrah } from "@/lib/umrah-planner/quote";
 import {
   type CollectInputNodeConfig,
@@ -1018,7 +1018,9 @@ async function submitTripDesignerQuote(
   details: TripDesignerDetails,
 ): Promise<TripDesignerQuote | null> {
   try {
-    return quoteTrip(details, await loadTripPlannerDataForAccount(db, accountId));
+    void db;
+    void accountId;
+    return quoteTrip(details);
   } catch (err) {
     console.error("[flows] local trip designer quote failed:", err);
   }
