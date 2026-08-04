@@ -702,6 +702,98 @@ function firstVar(vars: Record<string, unknown>, keys: string[]): string {
   return "";
 }
 
+function normalizedLabel(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function parseBulkFields(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const match = line.match(/^(?:[-*]|\d+[.)])?\s*([^:=\-]+?)\s*[:=\-]\s*(.+)$/);
+    if (!match) continue;
+    const label = normalizedLabel(match[1]);
+    const value = match[2].trim();
+    if (label && value) out[label] = value;
+  }
+  return out;
+}
+
+function bulkValue(fields: Record<string, string>, labels: string[]): string {
+  for (const label of labels) {
+    const value = fields[normalizedLabel(label)];
+    if (value) return value;
+  }
+  return "";
+}
+
+function bulkDetailsLookComplete(text: string, kind: "bulk_trip" | "bulk_umrah"): boolean {
+  const fields = parseBulkFields(text);
+  if (kind === "bulk_trip") {
+    return Boolean(
+      bulkValue(fields, ["date", "travel date", "trip date", "start date", "trip start date"]) &&
+        bulkValue(fields, ["from", "starting city", "departure city", "city"]) &&
+        bulkValue(fields, ["destination", "place", "tour", "package"]) &&
+        bulkValue(fields, ["days", "duration", "number of days"]) &&
+        bulkValue(fields, ["hotel", "hotel category", "category"]) &&
+        bulkValue(fields, ["transport", "vehicle", "car"]),
+    );
+  }
+  return Boolean(
+    bulkValue(fields, ["date", "travel date", "start date", "umrah date", "departure date"]) &&
+      bulkValue(fields, ["route", "umrah route"]) &&
+      bulkValue(fields, ["nights", "total nights", "duration"]) &&
+      bulkValue(fields, ["rooms", "room"]) &&
+      bulkValue(fields, ["room type", "sharing", "room sharing"]) &&
+      bulkValue(fields, ["hotel category", "category", "hotel"]) &&
+      bulkValue(fields, ["vehicle", "transport", "car"]),
+  );
+}
+
+function varsFromBulkDetails(vars: Record<string, unknown>): Record<string, string> {
+  const tripBulk = firstVar(vars, ["trip_bulk_details", "pakistan_bulk_details", "tour_bulk_details"]);
+  const umrahBulk = firstVar(vars, ["umrah_bulk_details"]);
+  const genericBulk = firstVar(vars, ["bulk_details", "quote_details"]);
+  const out: Record<string, string> = {};
+
+  if (tripBulk || genericBulk) {
+    const fields = parseBulkFields(tripBulk || genericBulk);
+    out.name = bulkValue(fields, ["name", "full name", "customer name"]);
+    out.email = bulkValue(fields, ["email", "email address"]);
+    out.trip_start_date = bulkValue(fields, ["date", "travel date", "trip date", "start date", "trip start date"]);
+    out.starting_city = bulkValue(fields, ["from", "starting city", "departure city", "city"]);
+    out.destination = bulkValue(fields, ["destination", "place", "tour", "package"]);
+    out.number_of_days = bulkValue(fields, ["days", "duration", "number of days"]);
+    out.hotel_category = bulkValue(fields, ["hotel", "hotel category", "category"]);
+    out.adults = bulkValue(fields, ["adults", "adult"]);
+    out.children = bulkValue(fields, ["children", "child"]);
+    out.rooms = bulkValue(fields, ["rooms", "room"]);
+    out.transport_type = bulkValue(fields, ["transport", "vehicle", "car"]);
+    out.query = bulkValue(fields, ["query", "requirement", "requirements", "special requirement", "notes"]);
+  }
+
+  if (umrahBulk || genericBulk) {
+    const fields = parseBulkFields(umrahBulk || genericBulk);
+    out.name ||= bulkValue(fields, ["name", "full name", "customer name"]);
+    out.email ||= bulkValue(fields, ["email", "email address"]);
+    out.umrah_start_date = bulkValue(fields, ["date", "travel date", "start date", "umrah date", "departure date"]);
+    out.umrah_route = bulkValue(fields, ["route", "umrah route"]);
+    out.umrah_nights = bulkValue(fields, ["nights", "total nights", "duration"]);
+    out.umrah_adults = bulkValue(fields, ["adults", "adult"]);
+    out.umrah_children = bulkValue(fields, ["children", "child"]);
+    out.umrah_infants = bulkValue(fields, ["infants", "infant"]);
+    out.umrah_rooms = bulkValue(fields, ["rooms", "room"]);
+    out.umrah_room_type = bulkValue(fields, ["room type", "sharing", "room sharing"]);
+    out.umrah_hotel_category = bulkValue(fields, ["hotel category", "category", "hotel"]);
+    out.umrah_vehicle = bulkValue(fields, ["vehicle", "transport", "car"]);
+    out.umrah_include_ziyarat = bulkValue(fields, ["ziyarat", "ziyarats", "include ziyarat"]);
+    out.query ||= bulkValue(fields, ["query", "requirement", "requirements", "special requirement", "notes"]);
+  }
+
+  return Object.fromEntries(Object.entries(out).filter(([, value]) => value.trim()));
+}
+
 function optionalInt(value: string): number | null {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : null;
@@ -758,13 +850,13 @@ function boolFromVar(value: string, fallback = false): boolean {
 
 function routePresetFromValue(value: string): string {
   const normalized = value.trim().toLowerCase();
-  if (["madinah then makkah", "madina then makkah", "md-mk", "medina-makkah"].includes(normalized)) {
+  if (["madinah then makkah", "madina then makkah", "md-mk", "medina-makkah", "madina-makkah", "madinah-makkah"].includes(normalized)) {
     return "md-mk";
   }
-  if (["makkah madinah makkah", "makkah madina makkah", "mk-md-mk"].includes(normalized)) {
+  if (["makkah madinah makkah", "makkah madina makkah", "makkah-madina-makkah", "makkah-madinah-makkah", "mk-md-mk"].includes(normalized)) {
     return "mk-md-mk";
   }
-  if (["madinah makkah madinah", "madina makkah madina", "md-mk-md"].includes(normalized)) {
+  if (["madinah makkah madinah", "madina makkah madina", "madina-makkah-madina", "madinah-makkah-madinah", "md-mk-md"].includes(normalized)) {
     return "md-mk-md";
   }
   return "mk-md";
@@ -1043,15 +1135,16 @@ async function upsertLeadCustomValue(
 async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<void> {
   if (!run.contact_id || !run.conversation_id) return;
 
-  const name = firstVar(run.vars, ["name", "full_name", "customer_name"]);
-  const email = firstVar(run.vars, ["email", "contact_email", "work_email"]);
-  const company = firstVar(run.vars, [
+  const vars = { ...varsFromBulkDetails(run.vars), ...run.vars };
+  const name = firstVar(vars, ["name", "full_name", "customer_name"]);
+  const email = firstVar(vars, ["email", "contact_email", "work_email"]);
+  const company = firstVar(vars, [
     "business_name",
     "business",
     "company",
     "company_name",
   ]);
-  const query = firstVar(run.vars, [
+  const query = firstVar(vars, [
     "query",
     "requirement",
     "requirements",
@@ -1059,22 +1152,22 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
     "question",
     "need",
   ]);
-  const tripStartDate = firstVar(run.vars, ["trip_start_date", "travel_date", "start_date"]);
-  const startingCity = firstVar(run.vars, ["starting_city", "origin_city", "from_city"]);
-  const destination = firstVar(run.vars, ["destination", "trip_destination"]);
-  const numberOfDays = firstVar(run.vars, ["number_of_days", "days", "duration"]);
-  const hotelCategory = firstVar(run.vars, ["hotel_category", "hotel"]);
-  const adults = firstVar(run.vars, ["adults"]);
-  const children = firstVar(run.vars, ["children"]);
-  const rooms = firstVar(run.vars, ["rooms", "number_of_rooms"]);
-  const transportType = firstVar(run.vars, ["transport_type", "transport"]);
-  const umrahStartDate = firstVar(run.vars, ["umrah_start_date"]);
-  const umrahNights = firstVar(run.vars, ["umrah_nights", "number_of_nights"]);
-  const umrahRoute = firstVar(run.vars, ["umrah_route", "route_preset_id"]);
-  const umrahVehicle = firstVar(run.vars, ["umrah_vehicle", "vehicle"]);
-  const umrahAdults = firstVar(run.vars, ["umrah_adults"]);
-  const umrahRooms = firstVar(run.vars, ["umrah_rooms"]);
-  const umrahHotelCategory = firstVar(run.vars, ["umrah_hotel_category"]);
+  const tripStartDate = firstVar(vars, ["trip_start_date", "travel_date", "start_date"]);
+  const startingCity = firstVar(vars, ["starting_city", "origin_city", "from_city"]);
+  const destination = firstVar(vars, ["destination", "trip_destination"]);
+  const numberOfDays = firstVar(vars, ["number_of_days", "days", "duration"]);
+  const hotelCategory = firstVar(vars, ["hotel_category", "hotel"]);
+  const adults = firstVar(vars, ["adults"]);
+  const children = firstVar(vars, ["children"]);
+  const rooms = firstVar(vars, ["rooms", "number_of_rooms"]);
+  const transportType = firstVar(vars, ["transport_type", "transport"]);
+  const umrahStartDate = firstVar(vars, ["umrah_start_date"]);
+  const umrahNights = firstVar(vars, ["umrah_nights", "number_of_nights"]);
+  const umrahRoute = firstVar(vars, ["umrah_route", "route_preset_id"]);
+  const umrahVehicle = firstVar(vars, ["umrah_vehicle", "vehicle"]);
+  const umrahAdults = firstVar(vars, ["umrah_adults"]);
+  const umrahRooms = firstVar(vars, ["umrah_rooms"]);
+  const umrahHotelCategory = firstVar(vars, ["umrah_hotel_category"]);
   const hasUmrahPlannerDetails = Boolean(
     umrahStartDate &&
       umrahNights &&
@@ -1173,7 +1266,7 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
           name,
           email,
           query,
-          vars: run.vars,
+          vars,
         })
       : null;
     const umrahPlannerQuote = umrahPlannerDetails
@@ -1827,6 +1920,17 @@ async function handleReplyForActiveRun(
   ) {
     const cfg = currentNode.config as unknown as CollectInputNodeConfig;
     const captured = message.text.trim();
+    if (
+      captured.length > 0 &&
+      (cfg.validation === "bulk_trip" || cfg.validation === "bulk_umrah") &&
+      !bulkDetailsLookComplete(captured, cfg.validation)
+    ) {
+      await logEvent(db, run.id, "fallback_fired", currentNode.node_key, {
+        action: "ignore",
+        reason: "bulk_details_incomplete",
+      });
+      return { consumed: false, flow_run_id: run.id, outcome: "no_match" };
+    }
     if (captured.length > 0 && cfg.var_key) {
       // Persist captured value + reset reprompt count atomically.
       const newVars = { ...run.vars, [cfg.var_key]: captured };

@@ -135,7 +135,7 @@ export interface CollectInputNodeConfig {
    * Reserved for v2. Accepted on the config but ignored by the v1.5
    * runner — captures any non-empty text.
    */
-  validation?: "any" | "email" | "phone" | "regex";
+  validation?: "any" | "email" | "phone" | "regex" | "bulk_trip" | "bulk_umrah";
   /** Used only when `validation === 'regex'`. */
   regex?: string;
   /** Node to advance to after capture. */
