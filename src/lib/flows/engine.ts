@@ -745,7 +745,7 @@ function looksLikeDateValue(value: string | undefined): boolean {
 
 function parseOrderedTripDetails(text: string): Record<string, string> {
   const lines = nonEmptyBulkLines(text);
-  if (lines.length < 9 || lines.some((line) => /[:=]/.test(line))) return {};
+  if (lines.length < 7 || lines.some((line) => /[:=]/.test(line))) return {};
   let index = 0;
   let name = "";
   let email = "";
@@ -757,18 +757,23 @@ function parseOrderedTripDetails(text: string): Record<string, string> {
     email = isSkipValue(lines[index]) ? "" : lines[index];
     index += 1;
   }
-  const [
-    trip_start_date,
-    starting_city,
-    destination,
-    number_of_days,
-    adults,
-    children,
-    rooms,
-    hotel_category,
-    transport_type,
-    ...rest
-  ] = lines.slice(index);
+  const core = lines.slice(index);
+  const [trip_start_date, starting_city, destination, number_of_days, adults] = core;
+  const tail = core.slice(5);
+  let children = "0";
+  let rooms = "1";
+  let hotel_category = "";
+  let transport_type = "";
+  let rest: string[] = [];
+
+  if (tail.length >= 4) {
+    [children, rooms, hotel_category, transport_type, ...rest] = tail;
+  } else if (tail.length === 3) {
+    [children, hotel_category, transport_type, ...rest] = tail;
+  } else if (tail.length >= 2) {
+    [hotel_category, transport_type, ...rest] = tail;
+  }
+
   if (!trip_start_date || !starting_city || !destination || !number_of_days || !hotel_category || !transport_type) {
     return {};
   }
