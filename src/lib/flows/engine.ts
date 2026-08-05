@@ -1122,10 +1122,13 @@ function formatTripDesignerWhatsappReply(
   details: TripDesignerDetails,
 ): string {
   const itineraryLines = (quote.itinerary ?? [])
-    .slice(0, Math.min(Number(details.number_of_days) || 5, 6))
+    .slice(0, Number(details.number_of_days) || quote.itinerary?.length || 7)
     .map((day) => {
-      const firstItem = day.items?.find((item) => item.activity)?.activity;
-      return `Day ${day.day ?? ""}: ${day.title || firstItem || "Trip activity"}`;
+      const itemLines = (day.items ?? [])
+        .map((item) => `${item.time || "Plan"}: ${item.activity || ""}`.trim())
+        .filter(Boolean)
+        .join(" | ");
+      return `Day ${day.day ?? ""}: ${day.title || "Trip activity"}${itemLines ? ` - ${itemLines}` : ""}`;
     })
     .filter(Boolean);
 
@@ -1601,18 +1604,21 @@ async function advanceFromNodeKey(
     }
     if (node.node_type === "send_message") {
       const cfg = node.config as unknown as SendMessageNodeConfig;
+      const text = interpolateVars(cfg.text, run.vars).trim();
       try {
-        const { whatsapp_message_id } = await engineSendText({
-          accountId: run.account_id,
-    userId: run.user_id,
-          conversationId: run.conversation_id!,
-          contactId: run.contact_id!,
-          text: interpolateVars(cfg.text, run.vars),
-        });
-        await logEvent(db, run.id, "message_sent", node.node_key, {
-          node_type: "send_message",
-          whatsapp_message_id,
-        });
+        if (text) {
+          const { whatsapp_message_id } = await engineSendText({
+            accountId: run.account_id,
+      userId: run.user_id,
+            conversationId: run.conversation_id!,
+            contactId: run.contact_id!,
+            text,
+          });
+          await logEvent(db, run.id, "message_sent", node.node_key, {
+            node_type: "send_message",
+            whatsapp_message_id,
+          });
+        }
       } catch (err) {
         await logEvent(db, run.id, "error", node.node_key, {
           reason: "send_text_failed",
