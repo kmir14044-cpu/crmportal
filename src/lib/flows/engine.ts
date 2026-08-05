@@ -312,6 +312,7 @@ interface UmrahPlannerDetails {
   room_type: string;
   hotel_category: string;
   vehicle: string;
+  transport_mode: "full" | "selective";
   include_visa: boolean;
   include_ziyarat: boolean;
   query: string;
@@ -996,11 +997,13 @@ function buildUmrahPlannerDetails(args: {
   const contactPhone =
     typeof args.contact?.phone === "string" ? args.contact.phone.trim() : "";
   const route = firstVar(args.vars, ["umrah_route", "route", "route_preset_id"]);
+  const phone = firstVar(args.vars, ["phone", "whatsapp_number", "customer_phone"]);
+  const transportMode = firstVar(args.vars, ["umrah_transport_mode", "transport_mode"]);
 
   return {
     name: args.name || contactName || "WhatsApp lead",
     email: args.email || contactEmail,
-    phone: contactPhone,
+    phone: phone || contactPhone,
     start_date: firstVar(args.vars, ["umrah_start_date", "start_date", "travel_date"]),
     route_preset_id: routePresetFromValue(route),
     nights: firstVar(args.vars, ["umrah_nights", "nights", "number_of_nights", "days"]) || "6",
@@ -1011,6 +1014,7 @@ function buildUmrahPlannerDetails(args: {
     room_type: firstVar(args.vars, ["umrah_room_type", "room_type"]) || "Double",
     hotel_category: firstVar(args.vars, ["umrah_hotel_category", "hotel_category", "hotel"]) || "Economy",
     vehicle: firstVar(args.vars, ["umrah_vehicle", "vehicle", "transport_type", "transport"]) || "Car",
+    transport_mode: transportMode === "selective" ? "selective" : "full",
     include_visa: boolFromVar(firstVar(args.vars, ["umrah_include_visa", "include_visa"]), true),
     include_ziyarat: boolFromVar(firstVar(args.vars, ["umrah_include_ziyarat", "include_ziyarat"]), false),
     query: args.query || firstVar(args.vars, ["umrah_query", "query", "requirement"]),
