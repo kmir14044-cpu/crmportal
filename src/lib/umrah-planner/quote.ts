@@ -4,6 +4,13 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 type JsonRecord = Record<string, unknown>
 
 const RECORD_TYPES = ['settings', 'routePresets', 'hotels', 'transportVehicles', 'transportRates', 'ziyarats']
+const PORTAL_STORAGE_KEYS = [
+  'umrahSettings',
+  'umrahHotelOverrides',
+  'umrahTransportOverrides',
+  'umrahVehicleOverrides',
+  'umrahZiyaratOverrides',
+].join(',')
 
 const CATEGORY_RANK: Record<string, number> = { Economy: 0, Standard: 1, Executive: 2 }
 const DEFAULT_SECTOR_NAMES: Record<string, string> = {
@@ -92,6 +99,13 @@ export interface UmrahQuoteResult {
 function rows(data: JsonRecord, key: string): JsonRecord[] {
   const value = data[key]
   return Array.isArray(value) ? (value as JsonRecord[]) : []
+}
+
+function objectValues(value: unknown): JsonRecord[] {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return []
+  return Object.values(value as JsonRecord).filter(
+    (item): item is JsonRecord => Boolean(item && typeof item === 'object' && !Array.isArray(item)),
+  )
 }
 
 function norm(value: unknown): string {
@@ -437,6 +451,9 @@ export async function loadUmrahPlannerDataForAccount(
   db: SupabaseClient,
   accountId: string,
 ): Promise<JsonRecord> {
+  const portalData = await loadUmrahPortalData()
+  if (portalData) return portalData
+
   const { data, error } = await db
     .from('umrah_planner_records')
     .select('record_type,payload,active')
@@ -466,4 +483,54 @@ export async function loadUmrahPlannerDataForAccount(
     target.push({ ...(row.payload as JsonRecord), active: row.active })
   }
   return out
+}
+
+async function loadUmrahPortalData(): Promise<JsonRecord | null> {
+  const baseUrl = process.env.UMRAH_PORTAL_API_URL || process.env.UMRAH_PORTAL_STORAGE_URL
+  if (!baseUrl) return null
+
+  try {
+    const url = new URL(baseUrl)
+    if (!url.searchParams.has('action')) url.searchParams.set('action', 'storage')
+    if (!url.searchParams.has('keys')) url.searchParams.set('keys', PORTAL_STORAGE_KEYS)
+
+    const res = await fetch(url.toString(), {
+      headers: { Accept: 'application/json' },
+      cache: 'no-store',
+    })
+    if (!res.ok) {
+      console.error('[umrah planner] portal data fetch failed:', res.status, res.statusText)
+      return null
+    }
+    const payload = await res.json() as { ok?: boolean; items?: JsonRecord }
+    if (!payload.ok || !payload.items) return null
+    return normalizePortalStorageData(payload.items)
+  } catch (err) {
+    console.error('[umrah planner] portal data fetch failed:', err)
+    return null
+  }
+}
+
+function normalizePortalStorageData(items: JsonRecord): JsonRecord {
+  const settingsValue = items.umrahSettings && typeof items.umrahSettings === 'object'
+    ? items.umrahSettings as JsonRecord
+    : {}
+  const hotels = objectValues(items.umrahHotelOverrides)
+  const transportRates = objectValues(items.umrahTransportOverrides)
+  const vehicles = objectValues(items.umrahVehicleOverrides)
+  const ziyarats = objectValues(items.umrahZiyaratOverrides)
+
+  return {
+    ...defaultData,
+    settings: {
+      ...settings(defaultData),
+      ...settingsValue,
+    },
+    hotels: hotels.length ? hotels : rows(defaultData, 'hotels'),
+    transportRates: transportRates.length ? transportRates : rows(defaultData, 'transportRates'),
+    transportVehicles: vehicles.length
+      ? vehicles.map((vehicle) => String(vehicle.id ?? vehicle.name ?? '')).filter(Boolean)
+      : defaultData.transportVehicles,
+    ziyarats: ziyarats.length ? ziyarats : rows(defaultData, 'ziyarats'),
+  }
 }
