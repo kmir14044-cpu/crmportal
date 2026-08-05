@@ -41,8 +41,7 @@ import {
 } from "./meta-send";
 import { decideFallback, resolveFallbackPolicy } from "./fallback";
 import { quoteTrip } from "@/lib/trip-planner/quote";
-import { loadUmrahPlannerDataForAccount, quoteUmrah, type UmrahQuoteInput, type UmrahQuoteResult } from "@/lib/umrah-planner/quote";
-import { saveUmrahQuoteSession } from "@/lib/umrah-planner/follow-up";
+import { loadUmrahPlannerDataForAccount, quoteUmrah } from "@/lib/umrah-planner/quote";
 import {
   type CollectInputNodeConfig,
   type ConditionNodeConfig,
@@ -51,6 +50,7 @@ import {
   type FlowNodeRow,
   type FlowRow,
   type FlowRunRow,
+  type HttpRequestNodeConfig,
   type ParsedInbound,
   type SendButtonsNodeConfig,
   type SendListNodeConfig,
@@ -184,6 +184,7 @@ export function isAutoAdvancing(node_type: string): boolean {
     node_type === "send_media" ||
     node_type === "condition" ||
     node_type === "set_tag" ||
+    node_type === "http_request" ||
     node_type === "start_flow"
   );
 }
@@ -1022,6 +1023,141 @@ function buildUmrahPlannerDetails(args: {
   };
 }
 
+
+
+const HTTP_RESPONSE_MAX_BYTES = 100_000;
+const HTTP_TIMEOUT_MAX_MS = 30_000;
+
+function interpolateUnknown(value: unknown, vars: Record<string, unknown>): unknown {
+  if (typeof value === "string") return interpolateVars(value, vars);
+  if (Array.isArray(value)) return value.map((item) => interpolateUnknown(item, vars));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        interpolateUnknown(item, vars),
+      ]),
+    );
+  }
+  return value;
+}
+
+function valueAtPath(input: unknown, path: string): unknown {
+  if (!path.trim()) return input;
+  return path.split(".").reduce<unknown>((value, key) => {
+    if (value === null || value === undefined) return undefined;
+    if (Array.isArray(value) && /^\d+$/.test(key)) return value[Number(key)];
+    if (typeof value === "object") return (value as Record<string, unknown>)[key];
+    return undefined;
+  }, input);
+}
+
+function flowVarValue(value: unknown): unknown {
+  if (value === null || ["string", "number", "boolean"].includes(typeof value)) return value;
+  return value === undefined ? "" : JSON.stringify(value);
+}
+
+function allowedHttpHosts(): Set<string> {
+  const configured = (process.env.FLOW_HTTP_ALLOWED_HOSTS ?? "")
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean);
+  for (const candidate of [process.env.NEXT_PUBLIC_APP_URL, process.env.APP_URL]) {
+    if (!candidate) continue;
+    try { configured.push(new URL(candidate).hostname.toLowerCase()); } catch { /* ignored */ }
+  }
+  return new Set(configured);
+}
+
+function assertAllowedHttpUrl(rawUrl: string): URL {
+  const url = new URL(rawUrl);
+  if (url.protocol !== "https:") throw new Error("Only HTTPS URLs are allowed");
+  const allowed = allowedHttpHosts();
+  if (!allowed.size || !allowed.has(url.hostname.toLowerCase())) {
+    throw new Error(`HTTP host is not allowlisted: ${url.hostname}`);
+  }
+  return url;
+}
+
+async function executeHttpRequestNode(args: {
+  db: AdminClient;
+  run: FlowRunRow;
+  node: FlowNodeRow;
+  config: HttpRequestNodeConfig;
+}): Promise<{ next: string; ok: boolean }> {
+  const { db, run, node, config } = args;
+  const startedAt = Date.now();
+  try {
+    const url = assertAllowedHttpUrl(interpolateVars(config.url, run.vars));
+    const headers: Record<string, string> = {};
+    for (const [name, value] of Object.entries(config.headers ?? {})) {
+      headers[name] = interpolateVars(value, run.vars);
+    }
+    for (const [name, envName] of Object.entries(config.secret_env_headers ?? {})) {
+      if (!/^[A-Z][A-Z0-9_]*$/.test(envName)) throw new Error(`Invalid secret environment name: ${envName}`);
+      const secret = process.env[envName];
+      if (!secret) throw new Error(`Missing server secret: ${envName}`);
+      headers[name] = secret;
+    }
+
+    const method = config.method ?? "POST";
+    const hasBody = !["GET", "DELETE"].includes(method) && config.body !== undefined;
+    if (hasBody && !Object.keys(headers).some((name) => name.toLowerCase() === "content-type")) {
+      headers["content-type"] = "application/json";
+    }
+    const timeoutMs = Math.min(Math.max(config.timeout_ms ?? 15_000, 1_000), HTTP_TIMEOUT_MAX_MS);
+    const response = await fetch(url, {
+      method,
+      headers,
+      body: hasBody ? JSON.stringify(interpolateUnknown(config.body, run.vars)) : undefined,
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "error",
+    });
+    const raw = await response.text();
+    if (new TextEncoder().encode(raw).byteLength > HTTP_RESPONSE_MAX_BYTES) {
+      throw new Error("HTTP response exceeded 100 KB");
+    }
+    let parsed: unknown = raw;
+    if (raw) {
+      try { parsed = JSON.parse(raw); } catch { /* preserve text */ }
+    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}: ${raw.slice(0, 300)}`);
+
+    const patch: Record<string, unknown> = {
+      http_status: response.status,
+      http_ok: true,
+    };
+    if (config.response_var) patch[config.response_var] = parsed;
+    for (const [varKey, responsePath] of Object.entries(config.response_mappings ?? {})) {
+      patch[varKey] = flowVarValue(valueAtPath(parsed, responsePath));
+    }
+    const newVars = { ...run.vars, ...patch };
+    const { error } = await db.from("flow_runs").update({ vars: newVars }).eq("id", run.id);
+    if (error) throw new Error(`Could not save HTTP response vars: ${error.message}`);
+    run.vars = newVars;
+    await logEvent(db, run.id, "node_entered", node.node_key, {
+      node_type: "http_request",
+      host: url.hostname,
+      method,
+      status: response.status,
+      duration_ms: Date.now() - startedAt,
+      captured_keys: Object.keys(patch),
+    });
+    return { next: config.success_next, ok: true };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const newVars = { ...run.vars, http_ok: false, http_error: message.slice(0, 500) };
+    await db.from("flow_runs").update({ vars: newVars }).eq("id", run.id);
+    run.vars = newVars;
+    await logEvent(db, run.id, "error", node.node_key, {
+      reason: "http_request_failed",
+      detail: message.slice(0, 500),
+      duration_ms: Date.now() - startedAt,
+    });
+    return { next: config.error_next, ok: false };
+  }
+}
+
 async function submitTripDesignerQuote(
   db: AdminClient,
   accountId: string,
@@ -1532,22 +1668,7 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
         console.error("[flows] trip designer WhatsApp reply failed:", err);
       }
     }
-    if (umrahPlannerQuote?.whatsappText && umrahPlannerDetails) {
-      try {
-        await saveUmrahQuoteSession(
-          db,
-          {
-            accountId: run.account_id,
-            userId: run.user_id,
-            contactId: run.contact_id,
-            conversationId: run.conversation_id,
-          },
-          umrahPlannerDetails as UmrahQuoteInput,
-          umrahPlannerQuote as UmrahQuoteResult,
-        );
-      } catch (err) {
-        console.error("[flows] saving Umrah quote session failed:", err);
-      }
+    if (umrahPlannerQuote?.whatsappText) {
       try {
         await engineSendText({
           accountId: run.account_id,
@@ -1778,6 +1899,13 @@ async function advanceFromNodeKey(
         });
       }
       currentKey = cfg.next_node_key;
+      continue;
+    }
+
+    if (node.node_type === "http_request") {
+      const cfg = node.config as unknown as HttpRequestNodeConfig;
+      const result = await executeHttpRequestNode({ db, run, node, config: cfg });
+      currentKey = result.next;
       continue;
     }
     if (node.node_type === "start_flow") {
