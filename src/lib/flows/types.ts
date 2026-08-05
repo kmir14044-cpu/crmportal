@@ -179,6 +179,33 @@ export interface SetTagNodeConfig {
   next_node_key: string;
 }
 
+
+export interface HttpRequestNodeConfig {
+  /** HTTP method used for the request. */
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  /** HTTPS URL. Supports {{vars.key}} interpolation. */
+  url: string;
+  /** Non-secret headers. Values support {{vars.key}} interpolation. */
+  headers?: Record<string, string>;
+  /**
+   * Secret headers loaded from server environment variables.
+   * Example: { "authorization": "UMRAH_PORTAL_AUTH_HEADER" }.
+   */
+  secret_env_headers?: Record<string, string>;
+  /** JSON request body. String values support {{vars.key}} interpolation. */
+  body?: unknown;
+  /** Request timeout, capped by the engine at 30 seconds. */
+  timeout_ms?: number;
+  /** Optional var key that receives the complete parsed response body. */
+  response_var?: string;
+  /** Map flow var keys to dot-paths in the JSON response. */
+  response_mappings?: Record<string, string>;
+  /** Route used for any 2xx response. */
+  success_next: string;
+  /** Route used for network errors, invalid responses, or non-2xx status. */
+  error_next: string;
+}
+
 export interface StartFlowNodeConfig {
   /**
    * Target flow name or UUID. Names are resolved inside the same account
@@ -211,6 +238,7 @@ export type FlowNodeConfig =
   | { node_type: "collect_input"; config: CollectInputNodeConfig }
   | { node_type: "condition"; config: ConditionNodeConfig }
   | { node_type: "set_tag"; config: SetTagNodeConfig }
+  | { node_type: "http_request"; config: HttpRequestNodeConfig }
   | { node_type: "start_flow"; config: StartFlowNodeConfig }
   | { node_type: "handoff"; config: HandoffNodeConfig }
   | { node_type: "end"; config: EndNodeConfig };
