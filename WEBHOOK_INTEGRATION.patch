@@ -1,0 +1,25 @@
+--- a/src/app/api/whatsapp/webhook/route.ts
++++ b/src/app/api/whatsapp/webhook/route.ts
+@@
+ import { dispatchInboundToFlows } from '@/lib/flows/engine'
++import { dispatchInboundToUmrahFollowUp } from '@/lib/umrah-planner/follow-up'
+@@
+   const flowResult = await dispatchInboundToFlows({
+@@
+   })
+-  const flowConsumed = flowResult.consumed
++  const umrahFollowUp = !flowResult.consumed
++    ? await dispatchInboundToUmrahFollowUp({
++        db: supabaseAdmin(),
++        accountId,
++        userId: configOwnerUserId,
++        contactId: contactRecord.id,
++        conversationId: conversation.id,
++        text: contentText ?? message.text?.body ?? '',
++        interactiveReplyId,
++      })
++    : { consumed: false }
++  const flowConsumed = flowResult.consumed || umrahFollowUp.consumed
+@@
+-  if ((!flowConsumed || flowHandedOff) && !interactiveReplyId && inboundText.trim()) {
++  if ((!flowConsumed || flowHandedOff) && !interactiveReplyId && inboundText.trim()) {

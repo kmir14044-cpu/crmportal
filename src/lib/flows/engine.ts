@@ -1051,6 +1051,31 @@ function routePresetFromValue(value: string): string {
   return "mk-md";
 }
 
+function stringArrayFromVars(
+  vars: Record<string, unknown>,
+  keys: string[],
+): string[] {
+  for (const key of keys) {
+    const value = vars[key];
+    if (Array.isArray(value)) {
+      return value.map(String).map((item) => item.trim()).filter(Boolean);
+    }
+    if (typeof value === "string" && value.trim()) {
+      const raw = value.trim();
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed.map(String).map((item) => item.trim()).filter(Boolean);
+        }
+      } catch {
+        // Dynamic list selections may be persisted as comma-separated text.
+      }
+      return raw.split(",").map((item) => item.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
 function buildUmrahPlannerDetails(args: {
   contact: Record<string, unknown> | null;
   name: string;
@@ -1089,8 +1114,16 @@ function buildUmrahPlannerDetails(args: {
       ...(firstVar(args.vars, ["umrah_makkah_hotel_id"]) ? { "Makkah-0": firstVar(args.vars, ["umrah_makkah_hotel_id"]) } : {}),
       ...(firstVar(args.vars, ["umrah_madinah_hotel_id"]) ? { "Madinah-1": firstVar(args.vars, ["umrah_madinah_hotel_id"]) } : {}),
     },
-    selected_sectors: Array.isArray(args.vars.umrah_selected_sectors) ? args.vars.umrah_selected_sectors.map(String) : [],
-    selected_ziyarats: Array.isArray(args.vars.umrah_selected_ziyarats) ? args.vars.umrah_selected_ziyarats.map(String) : [],
+    selected_sectors: stringArrayFromVars(args.vars, [
+      "umrah_selected_transport_sector_ids",
+      "umrah_selected_sectors",
+      "selected_sectors",
+    ]),
+    selected_ziyarats: stringArrayFromVars(args.vars, [
+      "umrah_selected_ziyarat_ids",
+      "umrah_selected_ziyarats",
+      "selected_ziyarats",
+    ]),
     query: args.query || firstVar(args.vars, ["umrah_query", "query", "requirement"]),
   };
 }
