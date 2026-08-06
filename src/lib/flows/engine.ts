@@ -1051,6 +1051,41 @@ function routePresetFromValue(value: string): string {
   return "mk-md";
 }
 
+
+function buildSelectedHotelsForRoute(
+  routePresetId: string,
+  makkahHotelId: string,
+  madinahHotelId: string,
+): Record<string, string> {
+  const selected: Record<string, string> = {};
+  const add = (key: string, value: string) => {
+    if (value) selected[key] = value;
+  };
+
+  switch (routePresetId) {
+    case "md-mk":
+      add("Madinah-0", madinahHotelId);
+      add("Makkah-1", makkahHotelId);
+      break;
+    case "mk-md-mk":
+      add("Makkah-0", makkahHotelId);
+      add("Madinah-1", madinahHotelId);
+      add("Makkah-2", makkahHotelId);
+      break;
+    case "md-mk-md":
+      add("Madinah-0", madinahHotelId);
+      add("Makkah-1", makkahHotelId);
+      add("Madinah-2", madinahHotelId);
+      break;
+    case "mk-md":
+    default:
+      add("Makkah-0", makkahHotelId);
+      add("Madinah-1", madinahHotelId);
+      break;
+  }
+  return selected;
+}
+
 function stringArrayFromVars(
   vars: Record<string, unknown>,
   keys: string[],
@@ -1092,13 +1127,19 @@ function buildUmrahPlannerDetails(args: {
   const route = firstVar(args.vars, ["umrah_route", "route", "route_preset_id"]);
   const phone = firstVar(args.vars, ["phone", "whatsapp_number", "customer_phone"]);
   const transportMode = firstVar(args.vars, ["umrah_transport_mode", "transport_mode"]);
+  const routePresetId = routePresetFromValue(route);
+  const selectedHotels = buildSelectedHotelsForRoute(
+    routePresetId,
+    firstVar(args.vars, ["umrah_makkah_hotel_id"]),
+    firstVar(args.vars, ["umrah_madinah_hotel_id"]),
+  );
 
   return {
     name: args.name || contactName || "WhatsApp lead",
     email: args.email || contactEmail,
     phone: phone || contactPhone,
     start_date: firstVar(args.vars, ["umrah_start_date", "start_date", "travel_date"]),
-    route_preset_id: routePresetFromValue(route),
+    route_preset_id: routePresetId,
     nights: firstVar(args.vars, ["umrah_nights", "nights", "number_of_nights", "days"]) || "6",
     adults: firstVar(args.vars, ["umrah_adults", "adults"]) || "2",
     children: firstVar(args.vars, ["umrah_children", "children"]) || "0",
@@ -1110,10 +1151,7 @@ function buildUmrahPlannerDetails(args: {
     transport_mode: transportMode === "selective" ? "selective" : "full",
     include_visa: boolFromVar(firstVar(args.vars, ["umrah_include_visa", "include_visa"]), true),
     include_ziyarat: boolFromVar(firstVar(args.vars, ["umrah_include_ziyarat", "include_ziyarat"]), false),
-    selected_hotels: {
-      ...(firstVar(args.vars, ["umrah_makkah_hotel_id"]) ? { "Makkah-0": firstVar(args.vars, ["umrah_makkah_hotel_id"]) } : {}),
-      ...(firstVar(args.vars, ["umrah_madinah_hotel_id"]) ? { "Madinah-1": firstVar(args.vars, ["umrah_madinah_hotel_id"]) } : {}),
-    },
+    selected_hotels: selectedHotels,
     selected_sectors: stringArrayFromVars(args.vars, [
       "umrah_selected_transport_sector_ids",
       "umrah_selected_sectors",
