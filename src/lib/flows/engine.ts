@@ -41,16 +41,18 @@ import {
 } from "./meta-send";
 import { decideFallback, resolveFallbackPolicy } from "./fallback";
 import { quoteTrip } from "@/lib/trip-planner/quote";
-import { loadUmrahPlannerDataForAccount, quoteUmrah } from "@/lib/umrah-planner/quote";
+import { loadUmrahPlannerDataForAccount, quoteUmrah, type UmrahQuoteInput, type UmrahQuoteResult } from "@/lib/umrah-planner/quote";
+import { saveUmrahQuoteSession } from "@/lib/umrah-planner/quote-session";
+import { loadUmrahDynamicOptions } from "./umrah-dynamic-options";
 import {
   type CollectInputNodeConfig,
   type ConditionNodeConfig,
   type DispatchInboundInput,
   type DispatchInboundResult,
+  type DynamicUmrahListNodeConfig,
   type FlowNodeRow,
   type FlowRow,
   type FlowRunRow,
-  type HttpRequestNodeConfig,
   type ParsedInbound,
   type SendButtonsNodeConfig,
   type SendListNodeConfig,
@@ -184,7 +186,6 @@ export function isAutoAdvancing(node_type: string): boolean {
     node_type === "send_media" ||
     node_type === "condition" ||
     node_type === "set_tag" ||
-    node_type === "http_request" ||
     node_type === "start_flow"
   );
 }
@@ -194,6 +195,7 @@ export function isSuspending(node_type: string): boolean {
   return (
     node_type === "send_buttons" ||
     node_type === "send_list" ||
+    node_type === "dynamic_umrah_list" ||
     node_type === "collect_input"
   );
 }
@@ -317,6 +319,9 @@ interface UmrahPlannerDetails {
   transport_mode: "full" | "selective";
   include_visa: boolean;
   include_ziyarat: boolean;
+  selected_hotels: Record<string, string>;
+  selected_sectors: string[];
+  selected_ziyarats: string[];
   query: string;
 }
 
@@ -524,6 +529,67 @@ async function findEntryFlow(
 // send_list also persist `last_prompt_message_id` so the inbox
 // thread can quote the prompt the customer is replying to.
 // ============================================================
+
+
+function dynamicReplyId(nodeKey: string, action: "select" | "finish" | "none" | "next" | "prev", value = ""): string {
+  return `udyn:${nodeKey}:${action}:${encodeURIComponent(value)}`.slice(0, 200);
+}
+
+function parseDynamicReplyId(replyId: string): { nodeKey: string; action: string; value: string } | null {
+  const match = replyId.match(/^udyn:([^:]+):(select|finish|none|next|prev):(.*)$/);
+  if (!match) return null;
+  return { nodeKey: match[1], action: match[2], value: decodeURIComponent(match[3] || "") };
+}
+
+async function sendDynamicUmrahListAndSuspend(
+  db: AdminClient,
+  run: FlowRunRow,
+  node: FlowNodeRow,
+): Promise<void> {
+  const cfg = node.config as unknown as DynamicUmrahListNodeConfig;
+  const pageVar = `__dynamic_page_${node.node_key}`;
+  const page = Math.max(0, Number(run.vars[pageVar] ?? 0) || 0);
+  const all = await loadUmrahDynamicOptions({
+    db,
+    accountId: run.account_id,
+    source: cfg.source,
+    vars: run.vars,
+  });
+  const pageSize = Math.min(8, Math.max(1, cfg.page_size ?? 7));
+  const start = page * pageSize;
+  const visible = all.slice(start, start + pageSize);
+  const rows = visible.map((option) => ({
+    id: dynamicReplyId(node.node_key, "select", option.value),
+    title: option.title.slice(0, 24),
+    description: option.description?.slice(0, 72),
+  }));
+  if (cfg.selection_mode === "multiple") {
+    rows.push({ id: dynamicReplyId(node.node_key, "finish"), title: "Finish selection", description: "Continue with selected items" });
+  }
+  if (cfg.allow_none) {
+    rows.push({ id: dynamicReplyId(node.node_key, "none"), title: "None", description: "Clear selection and continue" });
+  }
+  if (start + pageSize < all.length && rows.length < 10) {
+    rows.push({ id: dynamicReplyId(node.node_key, "next"), title: "Next page", description: `More ${cfg.source.replaceAll("_", " ")}` });
+  } else if (page > 0 && rows.length < 10) {
+    rows.push({ id: dynamicReplyId(node.node_key, "prev"), title: "Previous page", description: "Go back" });
+  }
+  if (!visible.length && !rows.length) {
+    await engineSendText({ accountId: run.account_id, userId: run.user_id, conversationId: run.conversation_id!, contactId: run.contact_id!, text: "No matching options are currently available. Our team will confirm this manually." });
+    return;
+  }
+  await engineSendInteractiveList({
+    accountId: run.account_id,
+    userId: run.user_id,
+    conversationId: run.conversation_id!,
+    contactId: run.contact_id!,
+    bodyText: interpolateVars(cfg.text, run.vars),
+    buttonLabel: cfg.button_label,
+    headerText: cfg.header_text,
+    footerText: cfg.footer_text,
+    sections: [{ title: "Available options", rows }],
+  });
+}
 
 async function sendButtonsAndSuspend(
   db: AdminClient,
@@ -1019,143 +1085,14 @@ function buildUmrahPlannerDetails(args: {
     transport_mode: transportMode === "selective" ? "selective" : "full",
     include_visa: boolFromVar(firstVar(args.vars, ["umrah_include_visa", "include_visa"]), true),
     include_ziyarat: boolFromVar(firstVar(args.vars, ["umrah_include_ziyarat", "include_ziyarat"]), false),
+    selected_hotels: {
+      ...(firstVar(args.vars, ["umrah_makkah_hotel_id"]) ? { "Makkah-0": firstVar(args.vars, ["umrah_makkah_hotel_id"]) } : {}),
+      ...(firstVar(args.vars, ["umrah_madinah_hotel_id"]) ? { "Madinah-1": firstVar(args.vars, ["umrah_madinah_hotel_id"]) } : {}),
+    },
+    selected_sectors: Array.isArray(args.vars.umrah_selected_sectors) ? args.vars.umrah_selected_sectors.map(String) : [],
+    selected_ziyarats: Array.isArray(args.vars.umrah_selected_ziyarats) ? args.vars.umrah_selected_ziyarats.map(String) : [],
     query: args.query || firstVar(args.vars, ["umrah_query", "query", "requirement"]),
   };
-}
-
-
-
-const HTTP_RESPONSE_MAX_BYTES = 100_000;
-const HTTP_TIMEOUT_MAX_MS = 30_000;
-
-function interpolateUnknown(value: unknown, vars: Record<string, unknown>): unknown {
-  if (typeof value === "string") return interpolateVars(value, vars);
-  if (Array.isArray(value)) return value.map((item) => interpolateUnknown(item, vars));
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
-        key,
-        interpolateUnknown(item, vars),
-      ]),
-    );
-  }
-  return value;
-}
-
-function valueAtPath(input: unknown, path: string): unknown {
-  if (!path.trim()) return input;
-  return path.split(".").reduce<unknown>((value, key) => {
-    if (value === null || value === undefined) return undefined;
-    if (Array.isArray(value) && /^\d+$/.test(key)) return value[Number(key)];
-    if (typeof value === "object") return (value as Record<string, unknown>)[key];
-    return undefined;
-  }, input);
-}
-
-function flowVarValue(value: unknown): unknown {
-  if (value === null || ["string", "number", "boolean"].includes(typeof value)) return value;
-  return value === undefined ? "" : JSON.stringify(value);
-}
-
-function allowedHttpHosts(): Set<string> {
-  const configured = (process.env.FLOW_HTTP_ALLOWED_HOSTS ?? "")
-    .split(",")
-    .map((host) => host.trim().toLowerCase())
-    .filter(Boolean);
-  for (const candidate of [process.env.NEXT_PUBLIC_APP_URL, process.env.APP_URL]) {
-    if (!candidate) continue;
-    try { configured.push(new URL(candidate).hostname.toLowerCase()); } catch { /* ignored */ }
-  }
-  return new Set(configured);
-}
-
-function assertAllowedHttpUrl(rawUrl: string): URL {
-  const url = new URL(rawUrl);
-  if (url.protocol !== "https:") throw new Error("Only HTTPS URLs are allowed");
-  const allowed = allowedHttpHosts();
-  if (!allowed.size || !allowed.has(url.hostname.toLowerCase())) {
-    throw new Error(`HTTP host is not allowlisted: ${url.hostname}`);
-  }
-  return url;
-}
-
-async function executeHttpRequestNode(args: {
-  db: AdminClient;
-  run: FlowRunRow;
-  node: FlowNodeRow;
-  config: HttpRequestNodeConfig;
-}): Promise<{ next: string; ok: boolean }> {
-  const { db, run, node, config } = args;
-  const startedAt = Date.now();
-  try {
-    const url = assertAllowedHttpUrl(interpolateVars(config.url, run.vars));
-    const headers: Record<string, string> = {};
-    for (const [name, value] of Object.entries(config.headers ?? {})) {
-      headers[name] = interpolateVars(value, run.vars);
-    }
-    for (const [name, envName] of Object.entries(config.secret_env_headers ?? {})) {
-      if (!/^[A-Z][A-Z0-9_]*$/.test(envName)) throw new Error(`Invalid secret environment name: ${envName}`);
-      const secret = process.env[envName];
-      if (!secret) throw new Error(`Missing server secret: ${envName}`);
-      headers[name] = secret;
-    }
-
-    const method = config.method ?? "POST";
-    const hasBody = !["GET", "DELETE"].includes(method) && config.body !== undefined;
-    if (hasBody && !Object.keys(headers).some((name) => name.toLowerCase() === "content-type")) {
-      headers["content-type"] = "application/json";
-    }
-    const timeoutMs = Math.min(Math.max(config.timeout_ms ?? 15_000, 1_000), HTTP_TIMEOUT_MAX_MS);
-    const response = await fetch(url, {
-      method,
-      headers,
-      body: hasBody ? JSON.stringify(interpolateUnknown(config.body, run.vars)) : undefined,
-      signal: AbortSignal.timeout(timeoutMs),
-      redirect: "error",
-    });
-    const raw = await response.text();
-    if (new TextEncoder().encode(raw).byteLength > HTTP_RESPONSE_MAX_BYTES) {
-      throw new Error("HTTP response exceeded 100 KB");
-    }
-    let parsed: unknown = raw;
-    if (raw) {
-      try { parsed = JSON.parse(raw); } catch { /* preserve text */ }
-    }
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${raw.slice(0, 300)}`);
-
-    const patch: Record<string, unknown> = {
-      http_status: response.status,
-      http_ok: true,
-    };
-    if (config.response_var) patch[config.response_var] = parsed;
-    for (const [varKey, responsePath] of Object.entries(config.response_mappings ?? {})) {
-      patch[varKey] = flowVarValue(valueAtPath(parsed, responsePath));
-    }
-    const newVars = { ...run.vars, ...patch };
-    const { error } = await db.from("flow_runs").update({ vars: newVars }).eq("id", run.id);
-    if (error) throw new Error(`Could not save HTTP response vars: ${error.message}`);
-    run.vars = newVars;
-    await logEvent(db, run.id, "node_entered", node.node_key, {
-      node_type: "http_request",
-      host: url.hostname,
-      method,
-      status: response.status,
-      duration_ms: Date.now() - startedAt,
-      captured_keys: Object.keys(patch),
-    });
-    return { next: config.success_next, ok: true };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const newVars = { ...run.vars, http_ok: false, http_error: message.slice(0, 500) };
-    await db.from("flow_runs").update({ vars: newVars }).eq("id", run.id);
-    run.vars = newVars;
-    await logEvent(db, run.id, "error", node.node_key, {
-      reason: "http_request_failed",
-      detail: message.slice(0, 500),
-      duration_ms: Date.now() - startedAt,
-    });
-    return { next: config.error_next, ok: false };
-  }
 }
 
 async function submitTripDesignerQuote(
@@ -1668,7 +1605,22 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
         console.error("[flows] trip designer WhatsApp reply failed:", err);
       }
     }
-    if (umrahPlannerQuote?.whatsappText) {
+    if (umrahPlannerQuote?.whatsappText && umrahPlannerDetails) {
+      try {
+        await saveUmrahQuoteSession(
+          db,
+          {
+            accountId: run.account_id,
+            userId: run.user_id,
+            contactId: run.contact_id,
+            conversationId: run.conversation_id,
+          },
+          umrahPlannerDetails as UmrahQuoteInput,
+          umrahPlannerQuote as UmrahQuoteResult,
+        );
+      } catch (err) {
+        console.error("[flows] saving Umrah quote session failed:", err);
+      }
       try {
         await engineSendText({
           accountId: run.account_id,
@@ -1901,13 +1853,6 @@ async function advanceFromNodeKey(
       currentKey = cfg.next_node_key;
       continue;
     }
-
-    if (node.node_type === "http_request") {
-      const cfg = node.config as unknown as HttpRequestNodeConfig;
-      const result = await executeHttpRequestNode({ db, run, node, config: cfg });
-      currentKey = result.next;
-      continue;
-    }
     if (node.node_type === "start_flow") {
       const cfg = node.config as unknown as StartFlowNodeConfig;
       const targetRef = startFlowTargetRef(cfg);
@@ -1969,6 +1914,12 @@ async function advanceFromNodeKey(
       run.current_node_key = flow.entry_node_id;
       currentKey = flow.entry_node_id;
       continue;
+    }
+    if (node.node_type === "dynamic_umrah_list") {
+      await sendDynamicUmrahListAndSuspend(db, run, node);
+      const advanced = await advanceCurrentNodeKey(db, run.id, run.current_node_key, node.node_key);
+      if (!advanced) await logEvent(db, run.id, "error", node.node_key, { reason: "lost_race_during_advance" });
+      return { outcome: "advanced" };
     }
     if (node.node_type === "send_buttons") {
       await sendButtonsAndSuspend(db, run, node);
@@ -2167,7 +2118,46 @@ async function handleReplyForActiveRun(
   //
   // Everything else falls through to the fallback policy below.
   let matched: string | null = null;
-  if (
+  if (message.kind === "interactive_reply" && currentNode.node_type === "dynamic_umrah_list") {
+    const cfg = currentNode.config as unknown as DynamicUmrahListNodeConfig;
+    const parsed = parseDynamicReplyId(message.reply_id);
+    if (parsed?.nodeKey === currentNode.node_key) {
+      const pageVar = `__dynamic_page_${currentNode.node_key}`;
+      if (parsed.action === "next" || parsed.action === "prev") {
+        const page = Math.max(0, Number(run.vars[pageVar] ?? 0) || 0) + (parsed.action === "next" ? 1 : -1);
+        const newVars = { ...run.vars, [pageVar]: page };
+        await db.from("flow_runs").update({ vars: newVars }).eq("id", run.id);
+        run.vars = newVars;
+        await sendDynamicUmrahListAndSuspend(db, run, currentNode);
+        return { consumed: true, flow_run_id: run.id, outcome: "advanced" };
+      }
+      if (parsed.action === "none") {
+        const newVars = { ...run.vars, [cfg.output_var]: cfg.selection_mode === "multiple" ? [] : "", [pageVar]: 0 };
+        await db.from("flow_runs").update({ vars: newVars, reprompt_count: 0 }).eq("id", run.id);
+        run.vars = newVars;
+        matched = cfg.next_node_key;
+      } else if (parsed.action === "finish" && cfg.selection_mode === "multiple") {
+        matched = cfg.next_node_key;
+      } else if (parsed.action === "select" && parsed.value) {
+        if (cfg.selection_mode === "multiple") {
+          const current = Array.isArray(run.vars[cfg.output_var]) ? run.vars[cfg.output_var] as unknown[] : [];
+          const values = current.map(String);
+          const next = values.includes(parsed.value) ? values.filter((v) => v !== parsed.value) : [...values, parsed.value];
+          const newVars = { ...run.vars, [cfg.output_var]: next, [pageVar]: 0 };
+          await db.from("flow_runs").update({ vars: newVars, reprompt_count: 0 }).eq("id", run.id);
+          run.vars = newVars;
+          await engineSendText({ accountId: run.account_id, userId: run.user_id, conversationId: run.conversation_id!, contactId: run.contact_id!, text: `${values.includes(parsed.value) ? "Removed" : "Added"}. ${next.length} item(s) selected. Choose another option or tap Finish selection.` });
+          await sendDynamicUmrahListAndSuspend(db, run, currentNode);
+          return { consumed: true, flow_run_id: run.id, outcome: "advanced" };
+        }
+        const newVars = { ...run.vars, [cfg.output_var]: parsed.value, [pageVar]: 0 };
+        await db.from("flow_runs").update({ vars: newVars, reprompt_count: 0 }).eq("id", run.id);
+        run.vars = newVars;
+        matched = cfg.next_node_key;
+      }
+    }
+  } else if (
+
     message.kind === "interactive_reply" &&
     (currentNode.node_type === "send_buttons" ||
       currentNode.node_type === "send_list")
@@ -2280,6 +2270,8 @@ async function handleReplyForActiveRun(
       await sendButtonsAndSuspend(db, run, currentNode);
     } else if (currentNode.node_type === "send_list") {
       await sendListAndSuspend(db, run, currentNode);
+    } else if (currentNode.node_type === "dynamic_umrah_list") {
+      await sendDynamicUmrahListAndSuspend(db, run, currentNode);
     } else if (currentNode.node_type === "collect_input") {
       // Customer typed something we couldn't accept (empty after trim,
       // or var_key missing — rare). Re-send the prompt so they try again.
