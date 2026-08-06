@@ -191,23 +191,23 @@ export async function dispatchInboundToUmrahFollowUp(input: UmrahFollowUpInput):
     }
     if (parsed.action === "select" && parsed.field === "makkah_hotel") {
       const selected = selectedHotelsForRoute(
-        session.request_payload.route_preset_id,
-        session.request_payload.selected_hotels,
-        "Makkah",
-        parsed.value,
-      );
+  session.request_payload.route_preset_id ?? "mk-md",
+  session.request_payload.selected_hotels ?? {},
+  "Makkah",
+  parsed.value,
+);
       const next: PendingEdit = { field: "madinah_hotel", source: "madinah_hotels", hotelStep: "madinah", page: 0 };
       session.request_payload = { ...session.request_payload, selected_hotels: selected };
       await input.db.from("umrah_quote_sessions").update({ request_payload: session.request_payload, pending_edit: next }).eq("account_id", input.accountId).eq("contact_id", input.contactId);
       await sendCatalog(input, session, next); return { consumed: true };
     }
     if (parsed.action === "select" && parsed.field === "madinah_hotel") {
-      const selected = selectedHotelsForRoute(
-        session.request_payload.route_preset_id,
-        session.request_payload.selected_hotels,
-        "Madinah",
-        parsed.value,
-      );
+    const selected = selectedHotelsForRoute(
+  session.request_payload.route_preset_id ?? "mk-md",
+  session.request_payload.selected_hotels ?? {},
+  "Madinah",
+  parsed.value,
+);
       await recalculate(input, session, { selected_hotels: selected }); return { consumed: true };
     }
     return { consumed: false };
