@@ -136,6 +136,10 @@ export interface CollectInputNodeConfig {
    * runner — captures any non-empty text.
    */
   validation?: "any" | "email" | "phone" | "regex" | "bulk_trip" | "bulk_umrah";
+  /** Optional natural-language normalization before capture. */
+  input_type?: "text" | "date" | "phone" | "integer";
+  ai_normalize?: boolean;
+  validation_error?: string;
   /** Used only when `validation === 'regex'`. */
   regex?: string;
   /** Node to advance to after capture. */

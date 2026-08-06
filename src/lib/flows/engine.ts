@@ -40,6 +40,7 @@ import {
   engineSendText,
 } from "./meta-send";
 import { decideFallback, resolveFallbackPolicy } from "./fallback";
+import { normalizeFlowInput } from "./normalize-input";
 import { quoteTrip } from "@/lib/trip-planner/quote";
 import { loadUmrahPlannerDataForAccount, quoteUmrah, type UmrahQuoteInput, type UmrahQuoteResult } from "@/lib/umrah-planner/quote";
 import { saveUmrahQuoteSession } from "@/lib/umrah-planner/quote-session";
@@ -2256,11 +2257,11 @@ async function handleReplyForActiveRun(
     currentNode.node_type === "collect_input"
   ) {
     const cfg = currentNode.config as unknown as CollectInputNodeConfig;
-    const captured = message.text.trim();
+    const rawCaptured = message.text.trim();
     if (
-      captured.length > 0 &&
+      rawCaptured.length > 0 &&
       (cfg.validation === "bulk_trip" || cfg.validation === "bulk_umrah") &&
-      !bulkDetailsLookComplete(captured, cfg.validation)
+      !bulkDetailsLookComplete(rawCaptured, cfg.validation)
     ) {
       await logEvent(db, run.id, "fallback_fired", currentNode.node_key, {
         action: "ignore",
@@ -2268,8 +2269,30 @@ async function handleReplyForActiveRun(
       });
       return { consumed: false, flow_run_id: run.id, outcome: "no_match" };
     }
+
+    let captured = rawCaptured;
+    if (cfg.ai_normalize && cfg.input_type && rawCaptured) {
+      const normalized = normalizeFlowInput({
+        inputType: cfg.input_type,
+        customerMessage: rawCaptured,
+      });
+      if (!normalized.matched || !normalized.value) {
+        // Let the normal AI responder answer genuine questions while
+        // keeping this flow suspended on the same field. If the text is
+        // simply an invalid value, the AI can explain the expected format.
+        await logEvent(db, run.id, "fallback_fired", currentNode.node_key, {
+          action: "ai_assist",
+          reason: normalized.reason ?? "normalization_failed",
+          expected_input_type: cfg.input_type,
+          validation_error: cfg.validation_error ?? null,
+        });
+        return { consumed: false, flow_run_id: run.id, outcome: "no_match" };
+      }
+      captured = normalized.value;
+    }
+
     if (captured.length > 0 && cfg.var_key) {
-      // Persist captured value + reset reprompt count atomically.
+      // Persist normalized value + reset reprompt count atomically.
       const newVars = { ...run.vars, [cfg.var_key]: captured };
       const { error: capErr } = await db
         .from("flow_runs")
@@ -2398,6 +2421,14 @@ async function startNewRun(
   // INSERT — partial unique index `idx_one_active_run_per_contact`
   // catches concurrent inserts with 23505. We catch and return as
   // consumed:true (the parallel webhook handles it).
+  const { data: contactRow } = await db
+    .from("contacts")
+    .select("phone")
+    .eq("id", input.contactId)
+    .eq("account_id", flow.account_id)
+    .maybeSingle();
+  const contactPhone = (contactRow as { phone?: string } | null)?.phone?.trim() ?? "";
+
   const { data: inserted, error: insErr } = await db
     .from("flow_runs")
     .insert({
@@ -2414,6 +2445,9 @@ async function startNewRun(
       conversation_id: input.conversationId,
       status: "active",
       current_node_key: flow.entry_node_id,
+      vars: contactPhone
+        ? { phone: contactPhone, whatsapp_number: contactPhone }
+        : {},
     })
     .select("*")
     .maybeSingle();

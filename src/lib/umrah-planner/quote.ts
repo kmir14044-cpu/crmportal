@@ -412,14 +412,14 @@ export function quoteUmrah(input: UmrahQuoteInput, data: JsonRecord = defaultDat
     itineraryText,
     ``,
     `Price breakdown:`,
-    hasMissingRates ? `- Hotels (available rates only): ${money(hotelTotal)}` : `- Hotels: ${money(hotelTotal)}`,
+    `- Hotels: ${money(hotelTotal)}`,
     `- Transport: ${money(transportTotal)}`,
     includeVisa ? `- Visa: ${money(visaTotal)}` : null,
     ziyaratTotal ? `- Ziyarat: ${money(ziyaratTotal)}` : null,
     `- Service/profit: ${money(profitTotal)}`,
     ``,
-    hasMissingRates ? `Partial estimated total: ${money(total)}` : `Estimated total: ${money(total)}`,
-    hasMissingRates ? `This total excludes hotel nights with missing portal rates. Manual rate confirmation is required before final booking.` : `Rates are based on available hotel season data.`,
+    `Estimated total: ${money(total)}`,
+    hasMissingRates ? `Some nights need manual rate confirmation before final booking.` : `Rates are based on available hotel season data.`,
     `Final price may vary based on availability and supplier confirmation.`,
   ].filter(Boolean).join('\n')
 
