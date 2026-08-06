@@ -32,6 +32,26 @@ function normalize(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
+function selectedHotelsForRoute(
+  routePresetId: string,
+  current: Record<string, string> | undefined,
+  city: "Makkah" | "Madinah",
+  hotelId: string,
+): Record<string, string> {
+  const next = { ...(current ?? {}) };
+  const stopsByRoute: Record<string, string[]> = {
+    "mk-md": ["Makkah", "Madinah"],
+    "md-mk": ["Madinah", "Makkah"],
+    "mk-md-mk": ["Makkah", "Madinah", "Makkah"],
+    "md-mk-md": ["Madinah", "Makkah", "Madinah"],
+  };
+  const stops = stopsByRoute[routePresetId] ?? stopsByRoute["mk-md"];
+  stops.forEach((stopCity, index) => {
+    if (stopCity === city) next[`${city}-${index}`] = hotelId;
+  });
+  return next;
+}
+
 function firstNumber(text: string, patterns: RegExp[]): number | null {
   for (const pattern of patterns) {
     const match = text.match(pattern);
@@ -70,7 +90,7 @@ function parseDirectChanges(text: string): Partial<UmrahQuoteInput> {
 
   if (/\beconomy\b/i.test(text)) changes.hotel_category = "Economy";
   else if (/\bstandard\b/i.test(text)) changes.hotel_category = "Standard";
-  else if (/\bpremium\b|\bluxury\b/i.test(text)) changes.hotel_category = "Premium";
+  else if (/\bexecutive\b|\bpremium\b|\bluxury\b|\b5[\s-]?star\b/i.test(text)) changes.hotel_category = "Executive";
 
   if (/\bmadin(?:a|ah)\s*(?:then|to|->|-)\s*makkah\b/i.test(text)) changes.route_preset_id = "md-mk";
   else if (/\bmakkah\s*(?:then|to|->|-)\s*madin(?:a|ah)\b/i.test(text)) changes.route_preset_id = "mk-md";
@@ -90,6 +110,35 @@ function parseDirectChanges(text: string): Partial<UmrahQuoteInput> {
     changes.transport_mode = "selective";
     changes.selected_sectors = [];
   }
+  return changes;
+}
+
+function applyRelativeChanges(
+  current: UmrahQuoteInput,
+  text: string,
+): Partial<UmrahQuoteInput> {
+  const changes: Partial<UmrahQuoteInput> = {};
+  const relative = (labels: string, currentValue: unknown): number | null => {
+    const escaped = labels;
+    const increase = text.match(new RegExp(`(?:increase|add|plus|raise)\\s+(?:the\\s+)?(?:${escaped})\\s+(?:by\\s+)?(\\d+)`, "i"))
+      ?? text.match(new RegExp(`(?:add|increase)\\s+(\\d+)\\s+(?:more\\s+)?(?:${escaped})`, "i"));
+    if (increase) return Math.max(0, Number(currentValue ?? 0) + Number(increase[1]));
+    const decrease = text.match(new RegExp(`(?:decrease|reduce|remove|minus|lower)\\s+(?:the\\s+)?(?:${escaped})\\s+(?:by\\s+)?(\\d+)`, "i"))
+      ?? text.match(new RegExp(`(?:remove|decrease)\\s+(\\d+)\\s+(?:${escaped})`, "i"));
+    if (decrease) return Math.max(0, Number(currentValue ?? 0) - Number(decrease[1]));
+    return null;
+  };
+
+  const nights = relative("nights?|days?", current.nights);
+  const adults = relative("adults?", current.adults);
+  const children = relative("children|child|kids?", current.children);
+  const infants = relative("infants?", current.infants);
+  const rooms = relative("rooms?", current.rooms);
+  if (nights != null) changes.nights = nights;
+  if (adults != null) changes.adults = Math.max(1, adults);
+  if (children != null) changes.children = children;
+  if (infants != null) changes.infants = infants;
+  if (rooms != null) changes.rooms = Math.max(1, rooms);
   return changes;
 }
 
@@ -170,14 +219,24 @@ export async function dispatchInboundToUmrahFollowUp(input: UmrahFollowUpInput):
       await updatePending(input, pending); await sendCatalog(input, session, pending); return { consumed: true };
     }
     if (parsed.action === "select" && parsed.field === "makkah_hotel") {
-      const selected = { ...(session.request_payload.selected_hotels ?? {}), "Makkah-0": parsed.value };
+      const selected = selectedHotelsForRoute(
+        session.request_payload.route_preset_id ?? "mk-md",
+        session.request_payload.selected_hotels ?? {},
+        "Makkah",
+        parsed.value,
+      );
       const next: PendingEdit = { field: "madinah_hotel", source: "madinah_hotels", hotelStep: "madinah", page: 0 };
       session.request_payload = { ...session.request_payload, selected_hotels: selected };
       await input.db.from("umrah_quote_sessions").update({ request_payload: session.request_payload, pending_edit: next }).eq("account_id", input.accountId).eq("contact_id", input.contactId);
       await sendCatalog(input, session, next); return { consumed: true };
     }
     if (parsed.action === "select" && parsed.field === "madinah_hotel") {
-      const selected = { ...(session.request_payload.selected_hotels ?? {}), "Madinah-1": parsed.value };
+      const selected = selectedHotelsForRoute(
+        session.request_payload.route_preset_id ?? "mk-md",
+        session.request_payload.selected_hotels ?? {},
+        "Madinah",
+        parsed.value,
+      );
       await recalculate(input, session, { selected_hotels: selected }); return { consumed: true };
     }
     return { consumed: false };
@@ -185,12 +244,46 @@ export async function dispatchInboundToUmrahFollowUp(input: UmrahFollowUpInput):
 
   const text = input.text?.trim() ?? "";
   if (!text) return { consumed: false };
+
+  const pendingTextEdit = session.pending_edit ?? {};
+  if (pendingTextEdit.field === "start_date") {
+    const dateChange = parseDirectChanges(text);
+    if (!dateChange.start_date) {
+      await engineSendText({
+        accountId: input.accountId,
+        userId: input.userId,
+        conversationId: input.conversationId,
+        contactId: input.contactId,
+        text: "Please send the new trip start date in YYYY-MM-DD format. Example: 2026-08-06",
+      });
+      return { consumed: true };
+    }
+    await recalculate(input, session, { start_date: dateChange.start_date });
+    return { consumed: true };
+  }
   if (/\b(send|show|get)\b.*\b(updated|latest|final)\b.*\b(itinerary|quotation|quote|package)\b/i.test(text)) {
     await engineSendText({ accountId: input.accountId, userId: input.userId, conversationId: input.conversationId, contactId: input.contactId, text: session.result_payload.whatsappText });
     return { consumed: true };
   }
 
-  if (/\b(change|select|show)\b.*\bhotel\b/i.test(text) || /\b(economy|standard|premium|luxury)\b/i.test(text)) {
+  if (/\b(change|update|edit|new)\b.*\b(date|travel date|start date)\b|\bchange date\b/i.test(text)) {
+    const direct = parseDirectChanges(text);
+    if (direct.start_date) {
+      await recalculate(input, session, { start_date: direct.start_date });
+    } else {
+      await updatePending(input, { field: "start_date" });
+      await engineSendText({
+        accountId: input.accountId,
+        userId: input.userId,
+        conversationId: input.conversationId,
+        contactId: input.contactId,
+        text: "Please send the new trip start date in YYYY-MM-DD format. Example: 2026-08-06",
+      });
+    }
+    return { consumed: true };
+  }
+
+  if (/\b(change|select|show|send|list)\b.*\bhotel\b/i.test(text) || /\b(economy|standard|executive|premium|luxury|[345][\s-]?star)\b/i.test(text)) {
     const categoryChanges = parseDirectChanges(text);
     session.request_payload = { ...session.request_payload, ...categoryChanges };
     const onlyMadinah = /madin(?:a|ah)/i.test(text) && !/makkah/i.test(text);
@@ -207,7 +300,10 @@ export async function dispatchInboundToUmrahFollowUp(input: UmrahFollowUpInput):
     await updatePending(input, pending); await sendCatalog(input, session, pending); return { consumed: true };
   }
 
-  const changes = parseDirectChanges(text);
+  const changes = {
+    ...parseDirectChanges(text),
+    ...applyRelativeChanges(session.request_payload, text),
+  };
   if (Object.keys(changes).length) { await recalculate(input, session, changes); return { consumed: true }; }
   return { consumed: false };
 }
