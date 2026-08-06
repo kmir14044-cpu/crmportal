@@ -113,35 +113,6 @@ function parseDirectChanges(text: string): Partial<UmrahQuoteInput> {
   return changes;
 }
 
-function applyRelativeChanges(
-  current: UmrahQuoteInput,
-  text: string,
-): Partial<UmrahQuoteInput> {
-  const changes: Partial<UmrahQuoteInput> = {};
-  const relative = (labels: string, currentValue: unknown): number | null => {
-    const escaped = labels;
-    const increase = text.match(new RegExp(`(?:increase|add|plus|raise)\\s+(?:the\\s+)?(?:${escaped})\\s+(?:by\\s+)?(\\d+)`, "i"))
-      ?? text.match(new RegExp(`(?:add|increase)\\s+(\\d+)\\s+(?:more\\s+)?(?:${escaped})`, "i"));
-    if (increase) return Math.max(0, Number(currentValue ?? 0) + Number(increase[1]));
-    const decrease = text.match(new RegExp(`(?:decrease|reduce|remove|minus|lower)\\s+(?:the\\s+)?(?:${escaped})\\s+(?:by\\s+)?(\\d+)`, "i"))
-      ?? text.match(new RegExp(`(?:remove|decrease)\\s+(\\d+)\\s+(?:${escaped})`, "i"));
-    if (decrease) return Math.max(0, Number(currentValue ?? 0) - Number(decrease[1]));
-    return null;
-  };
-
-  const nights = relative("nights?|days?", current.nights);
-  const adults = relative("adults?", current.adults);
-  const children = relative("children|child|kids?", current.children);
-  const infants = relative("infants?", current.infants);
-  const rooms = relative("rooms?", current.rooms);
-  if (nights != null) changes.nights = nights;
-  if (adults != null) changes.adults = Math.max(1, adults);
-  if (children != null) changes.children = children;
-  if (infants != null) changes.infants = infants;
-  if (rooms != null) changes.rooms = Math.max(1, rooms);
-  return changes;
-}
-
 function replyId(field: string, action: string, value = ""): string {
   return `uedit:${field}:${action}:${encodeURIComponent(value)}`.slice(0, 200);
 }
@@ -220,8 +191,8 @@ export async function dispatchInboundToUmrahFollowUp(input: UmrahFollowUpInput):
     }
     if (parsed.action === "select" && parsed.field === "makkah_hotel") {
       const selected = selectedHotelsForRoute(
-        session.request_payload.route_preset_id ?? "mk-md",
-        session.request_payload.selected_hotels ?? {},
+        session.request_payload.route_preset_id,
+        session.request_payload.selected_hotels,
         "Makkah",
         parsed.value,
       );
@@ -232,8 +203,8 @@ export async function dispatchInboundToUmrahFollowUp(input: UmrahFollowUpInput):
     }
     if (parsed.action === "select" && parsed.field === "madinah_hotel") {
       const selected = selectedHotelsForRoute(
-        session.request_payload.route_preset_id ?? "mk-md",
-        session.request_payload.selected_hotels ?? {},
+        session.request_payload.route_preset_id,
+        session.request_payload.selected_hotels,
         "Madinah",
         parsed.value,
       );
@@ -300,10 +271,7 @@ export async function dispatchInboundToUmrahFollowUp(input: UmrahFollowUpInput):
     await updatePending(input, pending); await sendCatalog(input, session, pending); return { consumed: true };
   }
 
-  const changes = {
-    ...parseDirectChanges(text),
-    ...applyRelativeChanges(session.request_payload, text),
-  };
+  const changes = parseDirectChanges(text);
   if (Object.keys(changes).length) { await recalculate(input, session, changes); return { consumed: true }; }
   return { consumed: false };
 }

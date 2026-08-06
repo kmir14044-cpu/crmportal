@@ -41,7 +41,6 @@ import {
 } from "./meta-send";
 import { decideFallback, resolveFallbackPolicy } from "./fallback";
 import { normalizeFlowInput } from "./normalize-input";
-import { parseUmrahBulkMessage } from "./umrah-bulk-intake";
 import { quoteTrip } from "@/lib/trip-planner/quote";
 import { loadUmrahPlannerDataForAccount, quoteUmrah, type UmrahQuoteInput, type UmrahQuoteResult } from "@/lib/umrah-planner/quote";
 import { saveUmrahQuoteSession } from "@/lib/umrah-planner/quote-session";
@@ -2259,36 +2258,7 @@ async function handleReplyForActiveRun(
   ) {
     const cfg = currentNode.config as unknown as CollectInputNodeConfig;
     const rawCaptured = message.text.trim();
-
-    if (rawCaptured.length > 0 && cfg.validation === "bulk_umrah_ai") {
-      const parsed = parseUmrahBulkMessage(rawCaptured, run.vars);
-      const newVars = { ...run.vars, ...parsed.fields };
-      await db.from("flow_runs").update({ vars: newVars, reprompt_count: 0 }).eq("id", run.id);
-      run.vars = newVars;
-
-      if (parsed.missing.length > 0) {
-        await engineSendText({
-          accountId: run.account_id,
-          userId: run.user_id,
-          conversationId: run.conversation_id!,
-          contactId: run.contact_id!,
-          text: parsed.prompt,
-        });
-        await logEvent(db, run.id, "fallback_fired", currentNode.node_key, {
-          action: "collect_missing_bulk_umrah",
-          missing: parsed.missing,
-        });
-        return { consumed: true, flow_run_id: run.id, outcome: "advanced" };
-      }
-
-      await logEvent(db, run.id, "node_entered", currentNode.node_key, {
-        captured_keys: Object.keys(parsed.fields),
-        bulk_intake_complete: true,
-      });
-      matched = cfg.next_node_key;
-    }
     if (
-      !matched &&
       rawCaptured.length > 0 &&
       (cfg.validation === "bulk_trip" || cfg.validation === "bulk_umrah") &&
       !bulkDetailsLookComplete(rawCaptured, cfg.validation)
@@ -2301,7 +2271,7 @@ async function handleReplyForActiveRun(
     }
 
     let captured = rawCaptured;
-    if (!matched && cfg.ai_normalize && cfg.input_type && rawCaptured) {
+    if (cfg.ai_normalize && cfg.input_type && rawCaptured) {
       const normalized = normalizeFlowInput({
         inputType: cfg.input_type,
         customerMessage: rawCaptured,
@@ -2321,7 +2291,7 @@ async function handleReplyForActiveRun(
       captured = normalized.value;
     }
 
-    if (!matched && captured.length > 0 && cfg.var_key) {
+    if (captured.length > 0 && cfg.var_key) {
       // Persist normalized value + reset reprompt count atomically.
       const newVars = { ...run.vars, [cfg.var_key]: captured };
       const { error: capErr } = await db
