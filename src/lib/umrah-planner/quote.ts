@@ -411,16 +411,11 @@ export function quoteUmrah(input: UmrahQuoteInput, data: JsonRecord = defaultDat
     `Itinerary:`,
     itineraryText,
     ``,
-    `Price breakdown:`,
-    hasMissingRates ? `- Hotels (available rates only): ${money(hotelTotal)}` : `- Hotels: ${money(hotelTotal)}`,
-    `- Transport: ${money(transportTotal)}`,
-    includeVisa ? `- Visa: ${money(visaTotal)}` : null,
-    ziyaratTotal ? `- Ziyarat: ${money(ziyaratTotal)}` : null,
-    `- Service/profit: ${money(profitTotal)}`,
+    `Total Package Price: ${money(total)}`,
+    hasMissingRates ? `Some hotel nights require manual rate confirmation before final booking.` : `Rates are based on the latest available hotel season data.`,
+    `Final confirmation is subject to hotel and supplier availability.`,
     ``,
-    hasMissingRates ? `Partial estimated total: ${money(total)}` : `Estimated total: ${money(total)}`,
-    hasMissingRates ? `This total excludes hotel nights with missing portal rates. Manual rate confirmation is required before final booking.` : `Rates are based on available hotel season data.`,
-    `Final price may vary based on availability and supplier confirmation.`,
+    `You can reply with any change, for example: change date, increase adults, reduce nights, change hotel category, change hotel, transport, room type, or Ziyarat.`,
   ].filter(Boolean).join('\n')
 
   return {

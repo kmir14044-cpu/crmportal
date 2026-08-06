@@ -2262,6 +2262,20 @@ async function handleReplyForActiveRun(
 
     if (rawCaptured.length > 0 && cfg.validation === "bulk_umrah_ai") {
       const parsed = parseUmrahBulkMessage(rawCaptured, run.vars);
+      const isConfirmed = /^(confirm|confirmed|yes|proceed|generate|ok|okay)$/i.test(rawCaptured);
+      const looksLikeQuestion = /^(what|why|how|which|where|when|can|could|does|do|is|are|tell|explain)\b|\?$/i.test(rawCaptured);
+
+      // A question inside the Umrah intake should be answered by the normal AI
+      // responder while this collect_input node remains active. The next user
+      // message returns here and continues collecting the same session.
+      if (!isConfirmed && parsed.extractedKeys.length === 0 && looksLikeQuestion) {
+        await logEvent(db, run.id, "fallback_fired", currentNode.node_key, {
+          action: "delegate_question_to_ai",
+          reason: "no_structured_umrah_fields_extracted",
+        });
+        return { consumed: false, flow_run_id: run.id, outcome: "no_match" };
+      }
+
       const newVars = { ...run.vars, ...parsed.fields };
       await db.from("flow_runs").update({ vars: newVars, reprompt_count: 0 }).eq("id", run.id);
       run.vars = newVars;
@@ -2282,7 +2296,6 @@ async function handleReplyForActiveRun(
       }
 
       const awaitingConfirmation = Boolean(run.vars.__umrah_awaiting_confirmation);
-      const isConfirmed = /^(confirm|confirmed|yes|proceed|generate|ok|okay)$/i.test(rawCaptured);
       if (!awaitingConfirmation || !isConfirmed) {
         const confirmationVars = { ...newVars, __umrah_awaiting_confirmation: true };
         await db.from("flow_runs").update({ vars: confirmationVars, reprompt_count: 0 }).eq("id", run.id);

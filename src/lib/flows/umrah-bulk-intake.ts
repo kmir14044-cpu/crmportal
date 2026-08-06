@@ -5,6 +5,7 @@ export interface UmrahBulkParseResult {
   missing: string[];
   prompt: string;
   confirmation: string;
+  extractedKeys: string[];
 }
 
 function integer(text: string, patterns: RegExp[]): number | null {
@@ -86,6 +87,7 @@ function routeLabel(value: unknown): string {
 
 function missingPrompt(missing: string[]): string {
   const labels: Record<string, string> = {
+    umrah_budget: "budget in PKR",
     umrah_start_date: "travel date",
     umrah_nights: "number of nights",
     umrah_route: "route (Makkah–Madinah or Madinah–Makkah)",
@@ -122,14 +124,19 @@ export function buildUmrahConfirmation(fields: Record<string, unknown>): string 
 
 export function parseUmrahBulkMessage(text: string, existing: Record<string, unknown> = {}): UmrahBulkParseResult {
   const fields: Record<string, unknown> = { ...existing };
+  const extractedKeys = new Set<string>();
+  const setField = (key: string, value: unknown) => {
+    fields[key] = value;
+    extractedKeys.add(key);
+  };
   const trimmed = text.trim();
   const lines = trimmed.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
   const date = normalizeFlowInput({ inputType: "date", customerMessage: text });
-  if (date.matched && date.value) fields.umrah_start_date = date.value;
+  if (date.matched && date.value) setField("umrah_start_date", date.value);
 
   const route = routeValue(text);
-  if (route) fields.umrah_route = route;
+  if (route) setField("umrah_route", route);
 
   let nights = integer(text, [/(\d+)\s*(?:nights?|days?)/i, /(?:nights?|duration)\s*(?:to|=|is|:)?\s*(\d+)/i]);
   const adults = integer(text, [/(\d+)\s*adults?/i, /adults?\s*(?:to|=|is|:)?\s*(\d+)/i]);
@@ -148,41 +155,41 @@ export function parseUmrahBulkMessage(text: string, existing: Record<string, unk
     if (likelyNights != null) nights = Math.round(likelyNights);
   }
 
-  if (nights != null) fields.umrah_nights = String(nights);
-  if (adults != null) fields.umrah_adults = String(adults);
-  if (children != null) fields.umrah_children = String(children);
-  if (infants != null) fields.umrah_infants = String(infants);
-  if (rooms != null) fields.umrah_rooms = String(rooms);
+  if (nights != null) setField("umrah_nights", String(nights));
+  if (adults != null) setField("umrah_adults", String(adults));
+  if (children != null) setField("umrah_children", String(children));
+  if (infants != null) setField("umrah_infants", String(infants));
+  if (rooms != null) setField("umrah_rooms", String(rooms));
 
   const roomType = roomTypeValue(text);
   const category = categoryValue(text);
   const vehicle = vehicleValue(text);
-  if (roomType) fields.umrah_room_type = roomType;
-  if (category) fields.umrah_hotel_category = category;
-  if (vehicle) fields.umrah_vehicle = vehicle;
+  if (roomType) setField("umrah_room_type", roomType);
+  if (category) setField("umrah_hotel_category", category);
+  if (vehicle) setField("umrah_vehicle", vehicle);
 
-  if (/\bselective\b|\bseparate transport\b/i.test(text)) fields.umrah_transport_mode = "selective";
+  if (/\bselective\b|\bseparate transport\b/i.test(text)) setField("umrah_transport_mode", "selective");
   else if (/\bno transport\b|\bwithout transport\b|\bremove transport\b/i.test(text)) {
-    fields.umrah_transport_mode = "none";
+    setField("umrah_transport_mode", "none");
     fields.umrah_selected_transport_sector_ids = [];
     delete fields.umrah_vehicle;
-  } else if (/\bfull transport\b|\ball transport\b|\bcomplete transport\b/i.test(text)) fields.umrah_transport_mode = "full";
+  } else if (/\bfull transport\b|\ball transport\b|\bcomplete transport\b/i.test(text)) setField("umrah_transport_mode", "full");
 
   const ziyarat = yesNo(text, /ziyarat|ziyarats|ziyarah/i);
-  if (ziyarat != null) fields.umrah_include_ziyarat = ziyarat ? "yes" : "no";
+  if (ziyarat != null) setField("umrah_include_ziyarat", ziyarat ? "yes" : "no");
   const visa = yesNo(text, /\bvisa\b/i);
-  if (visa != null) fields.umrah_include_visa = visa ? "yes" : "no";
-  if (budget != null) fields.umrah_budget = String(budget);
+  if (visa != null) setField("umrah_include_visa", visa ? "yes" : "no");
+  if (budget != null) setField("umrah_budget", String(budget));
 
   const requirementMatch = text.match(/(?:special requirements?|requirements?|notes?)\s*[:=-]\s*(.+)/i);
-  if (requirementMatch) fields.umrah_special_requirements = requirementMatch[1].trim();
+  if (requirementMatch) setField("umrah_special_requirements", requirementMatch[1].trim());
 
   if (!fields.umrah_children) fields.umrah_children = "0";
   if (!fields.umrah_infants) fields.umrah_infants = "0";
   if (!fields.umrah_include_visa) fields.umrah_include_visa = "yes";
 
   const required = [
-    "umrah_start_date", "umrah_nights", "umrah_route", "umrah_adults",
+    "umrah_budget", "umrah_start_date", "umrah_nights", "umrah_route", "umrah_adults",
     "umrah_rooms", "umrah_room_type", "umrah_hotel_category",
     "umrah_transport_mode", "umrah_include_ziyarat",
   ];
@@ -190,5 +197,5 @@ export function parseUmrahBulkMessage(text: string, existing: Record<string, unk
 
   const missing = required.filter((key) => fields[key] === undefined || fields[key] === null || String(fields[key]).trim() === "");
   const prompt = missing.length ? missingPrompt(missing) : "";
-  return { fields, missing, prompt, confirmation: buildUmrahConfirmation(fields) };
+  return { fields, missing, prompt, confirmation: buildUmrahConfirmation(fields), extractedKeys: [...extractedKeys] };
 }
