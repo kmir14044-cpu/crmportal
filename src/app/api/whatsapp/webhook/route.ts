@@ -8,6 +8,10 @@ import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
+import {
+  dispatchInboundToUmrahFollowUp,
+  hasEditableUmrahSession,
+} from '@/lib/umrah-planner/follow-up'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
   handleTemplateWebhookChange,
@@ -732,27 +736,56 @@ async function processMessage(
   // no active flows take the runner's early-exit "no_match" path
   // basically for free (one indexed SELECT for the active run).
   // ============================================================
-  const flowResult = await dispatchInboundToFlows({
-    accountId,
-    userId: configOwnerUserId,
-    contactId: contactRecord.id,
-    conversationId: conversation.id,
-    message:
-      interactiveReplyId
-        ? {
-            kind: 'interactive_reply',
-            reply_id: interactiveReplyId,
-            reply_title: contentText ?? '',
-            meta_message_id: message.id,
-          }
-        : {
-            kind: 'text',
-            text: contentText ?? message.text?.body ?? '',
-            meta_message_id: message.id,
-          },
-    isFirstInboundMessage,
-    lastCustomerMessageAt,
-  })
+  const inboundText = contentText ?? message.text?.body ?? ''
+
+  // Existing Umrah sessions take priority over generic flow triggers.
+  // This keeps collecting, confirmation, quoted, and editing sessions
+  // inside the Umrah assistant instead of restarting the welcome menu.
+  let umrahConsumed = false
+  if (inboundText.trim()) {
+    const hasUmrahSession = await hasEditableUmrahSession({
+      db: supabaseAdmin(),
+      accountId,
+      contactId: contactRecord.id,
+    })
+
+    if (hasUmrahSession) {
+      const umrahResult = await dispatchInboundToUmrahFollowUp({
+        db: supabaseAdmin(),
+        accountId,
+        userId: configOwnerUserId,
+        contactId: contactRecord.id,
+        conversationId: conversation.id,
+        text: inboundText,
+        interactiveReplyId,
+      })
+      umrahConsumed = umrahResult.consumed
+    }
+  }
+
+  const flowResult = umrahConsumed
+    ? { consumed: true, outcome: 'advanced' as const }
+    : await dispatchInboundToFlows({
+        accountId,
+        userId: configOwnerUserId,
+        contactId: contactRecord.id,
+        conversationId: conversation.id,
+        message:
+          interactiveReplyId
+            ? {
+                kind: 'interactive_reply',
+                reply_id: interactiveReplyId,
+                reply_title: contentText ?? '',
+                meta_message_id: message.id,
+              }
+            : {
+                kind: 'text',
+                text: inboundText,
+                meta_message_id: message.id,
+              },
+        isFirstInboundMessage,
+        lastCustomerMessageAt,
+      })
   const flowConsumed = flowResult.consumed
   const flowHandedOff = flowResult.outcome === 'handed_off'
 
@@ -761,7 +794,6 @@ async function processMessage(
   // message all exist before any step — including send_message — runs.
   // Fire-and-forget: a slow or failing automation must not block the
   // webhook's 200 OK response to Meta.
-  const inboundText = contentText ?? message.text?.body ?? ''
   const automationTriggers: (
     | 'new_contact_created'
     | 'first_inbound_message'
@@ -798,7 +830,12 @@ async function processMessage(
   // let AI try the same free-text inbound instead of leaving continuous
   // customer questions unanswered. `dispatchInboundToAiReply` still owns
   // its account/conversation gates (AI enabled, no assigned human, cap).
-  if ((!flowConsumed || flowHandedOff) && !interactiveReplyId && inboundText.trim()) {
+  if (
+    !umrahConsumed &&
+    (!flowConsumed || flowHandedOff) &&
+    !interactiveReplyId &&
+    inboundText.trim()
+  ) {
     await dispatchInboundToAiReply({
       accountId,
       conversationId: conversation.id,
