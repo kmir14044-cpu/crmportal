@@ -23,10 +23,13 @@ type PendingEdit = {
 };
 
 type SessionRow = {
+  status?: string;
   request_payload: UmrahQuoteInput;
   result_payload: UmrahQuoteResult;
   pending_edit?: PendingEdit;
 };
+
+const EDITABLE_SESSION_STATUSES = new Set(["collecting", "awaiting_confirmation", "quoted", "editing"]);
 
 function normalize(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -153,9 +156,20 @@ function parseReplyId(value: string): { field: string; action: string; value: st
 
 async function loadSession(input: UmrahFollowUpInput): Promise<SessionRow | null> {
   const { data, error } = await input.db.from("umrah_quote_sessions")
-    .select("request_payload,result_payload,pending_edit")
+    .select("status,request_payload,result_payload,pending_edit")
     .eq("account_id", input.accountId).eq("contact_id", input.contactId).maybeSingle();
   return error || !data ? null : data as SessionRow;
+}
+
+export async function hasEditableUmrahSession(input: Pick<UmrahFollowUpInput, "db" | "accountId" | "contactId">): Promise<boolean> {
+  const { data, error } = await input.db
+    .from("umrah_quote_sessions")
+    .select("status")
+    .eq("account_id", input.accountId)
+    .eq("contact_id", input.contactId)
+    .maybeSingle();
+  if (error || !data) return false;
+  return EDITABLE_SESSION_STATUSES.has(String((data as { status?: string }).status ?? ""));
 }
 
 async function updatePending(input: UmrahFollowUpInput, pending: PendingEdit): Promise<void> {
@@ -194,7 +208,7 @@ async function recalculate(input: UmrahFollowUpInput, session: SessionRow, chang
 
 export async function dispatchInboundToUmrahFollowUp(input: UmrahFollowUpInput): Promise<{ consumed: boolean }> {
   const session = await loadSession(input);
-  if (!session) return { consumed: false };
+  if (!session || !EDITABLE_SESSION_STATUSES.has(String(session.status ?? ""))) return { consumed: false };
 
   if (input.interactiveReplyId) {
     const parsed = parseReplyId(input.interactiveReplyId);

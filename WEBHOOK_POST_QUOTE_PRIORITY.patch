@@ -1,0 +1,55 @@
+*** Begin Patch
+*** Update File: src/app/api/whatsapp/webhook/route.ts
+@@
+ import { dispatchInboundToFlows } from '@/lib/flows/engine'
+ import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
++import {
++  dispatchInboundToUmrahFollowUp,
++  hasEditableUmrahSession,
++} from '@/lib/umrah-planner/follow-up'
+@@
+-  const flowResult = await dispatchInboundToFlows({
++  const inboundText = contentText ?? message.text?.body ?? ''
++
++  // Existing Umrah sessions must win before the generic flow trigger.
++  // This prevents post-quote edits such as "change Makkah hotel" from
++  // starting the welcome flow again.
++  let umrahConsumed = false
++  if (
++    inboundText.trim() &&
++    await hasEditableUmrahSession({
++      db: supabaseAdmin(),
++      accountId,
++      contactId: contactRecord.id,
++    })
++  ) {
++    const umrahResult = await dispatchInboundToUmrahFollowUp({
++      db: supabaseAdmin(),
++      accountId,
++      userId: configOwnerUserId,
++      contactId: contactRecord.id,
++      conversationId: conversation.id,
++      text: inboundText,
++      interactiveReplyId,
++    })
++    umrahConsumed = umrahResult.consumed
++  }
++
++  const flowResult = umrahConsumed
++    ? { consumed: true, outcome: 'advanced' as const }
++    : await dispatchInboundToFlows({
+@@
+-  })
++      })
+@@
+-  const inboundText = contentText ?? message.text?.body ?? ''
+   const automationTriggers: (
+@@
+-  if ((!flowConsumed || flowHandedOff) && !interactiveReplyId && inboundText.trim()) {
++  if (
++    !umrahConsumed &&
++    (!flowConsumed || flowHandedOff) &&
++    !interactiveReplyId &&
++    inboundText.trim()
++  ) {
+*** End Patch
