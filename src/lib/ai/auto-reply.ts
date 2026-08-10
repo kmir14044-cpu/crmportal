@@ -265,6 +265,45 @@ function firstNumber(value: string | undefined): number | null {
   return parseIntText(value?.match(/\b(\d{1,4})\b/)?.[1])
 }
 
+function wordNumber(value: string | undefined | null): number | null {
+  const text = value?.toLowerCase() ?? ''
+  const words: Record<string, number> = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+  }
+  for (const [word, number] of Object.entries(words)) {
+    if (new RegExp(`\\b${word}\\b`, 'i').test(text)) return number
+  }
+  return null
+}
+
+function latestBudgetFromMessages(messages: { role: string; content: string }[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    if (message.role !== 'user') continue
+    const explicit = message.content.match(/\b(?:budget|range)\s*[:\-]?\s*(?:pkr|rs\.?|₨)?\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1] ??
+      message.content.match(/\b([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)\s*(?:budget|range)\b/i)?.[1] ??
+      message.content.match(/\b(?:pkr|rs\.?|₨)\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
+    if (explicit) return explicit.trim()
+    const lines = message.content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    const bare = lines.find((line) => {
+      if (!/^\d[\d,.\s]*(?:k|lac|lakh|million|m)?$/i.test(line)) return false
+      const amount = budgetAmount(line)
+      return amount !== null && amount >= 1000
+    })
+    if (bare) return bare
+  }
+  return null
+}
+
 function latestDaysOverride(text: string): number | null {
   if (!/\b(reduce|change|set|update|duration|days?|nights?)\b/i.test(text)) return null
   return parseIntText(
@@ -349,8 +388,9 @@ function latestHotelQueryFromMessages(messages: { role: string; content: string 
 
 function roomCountFromText(value: string | undefined | null): number | null {
   if (!value) return null
+  if (/^\s*\d{1,2}\s*$/.test(value)) return firstNumber(value)
   if (!/\b(rooms?|room|single|double|triple|quad|sharing)\b/i.test(value)) return null
-  return firstNumber(value) ?? (/double/i.test(value) ? 1 : null)
+  return firstNumber(value) ?? (/single|double|triple|quad/i.test(value) ? 1 : null)
 }
 
 function likelyUsefulUmrahAnswer(text: string): boolean {
@@ -377,7 +417,8 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     ziyarat: lines[6],
     specialRequirements: lines.slice(7).join(' '),
   } : null
-  const parsedBudget = text.match(/\b(?:budget|range)\s*[:\-]?\s*(?:pkr|rs\.?|₨)?\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
+  const parsedBudget = latestBudgetFromMessages(userMessages)
+    ?? text.match(/\b(?:budget|range)\s*[:\-]?\s*(?:pkr|rs\.?|₨)?\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
     ?? text.match(/\b([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)\s*(?:budget|range)\b/i)?.[1]
     ?? text.match(/\b(?:pkr|rs\.?|₨)\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
     ?? (/^\d[\d,.\s]*(?:k|lac|lakh|million|m)?$/i.test(ordered?.budget ?? '') ? ordered?.budget : null)
@@ -388,11 +429,13 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     parseIntText(text.match(/\b(\d{1,3})\s*(?:days?|nights?)\b/i)?.[1]) ??
     firstNumber(ordered?.days)
   const parsedAdults = parseIntText(text.match(/\b(\d{1,3})\s*(?:adults?|persons?|people|pax|passengers?)\b/i)?.[1])
+    ?? wordNumber(text.match(/\b([a-z]+)\s+(?:adults?|persons?|people|pax|passengers?)\b/i)?.[1])
     ?? (/\bcouple\b/i.test(text) ? 2 : null)
     ?? firstNumber(ordered?.travelers)
   const parsedChildren = parseIntText(text.match(/\b(\d{1,3})\s*(?:kids?|children|child)\b/i)?.[1])
   const parsedInfants = parseIntText(text.match(/\b(\d{1,3})\s*(?:infants?|babies|baby)\b/i)?.[1])
   const parsedRooms = parseIntText(text.match(/\b(\d{1,3})\s*(?:\w+\s+){0,3}(?:rooms?|room)\b/i)?.[1])
+    ?? roomCountFromText(latest)
     ?? roomCountFromText(ordered?.rooms)
   const parsedHotelCategory = latestHotelCategoryFromMessages(detailMessages) ?? validHotelCategory(ordered?.hotelCategory)
   const parsedZiyarat =
@@ -401,7 +444,7 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     parseBoolPreference(ordered?.ziyarat ?? '')
   const selectedZiyarats = selectedZiyaratIdsFromMessages(userMessages)
   const parsedElderly = text.match(/\b(?:elderly|senior)[^,\n.]*/i)?.[0] ?? null
-  const parsedRoomSharing = text.match(/\b(?:sharing|double|triple|quad|single)[^,\n.]*/i)?.[0] ?? ordered?.rooms ?? null
+  const parsedRoomSharing = text.match(/\b(?:sharing|double|triple|quad|single)[^,\n.]*/i)?.[0] ?? (/^\s*(single|double|triple|quad)\s*$/i.test(latest) ? latest : null) ?? ordered?.rooms ?? null
   const parsedSpecialRequirements =
     (text.match(/\b(?:special requirements?|requirements?|preference)\s*[:\-]\s*([^\n]+)/i)?.[1] ??
     text.match(/\b(flight|transport|near haram|walking distance|wheelchair|hotel distance)[^.\n]*/i)?.[0] ??
@@ -1502,6 +1545,7 @@ export async function dispatchInboundToAiReply(
     console.error('[ai auto-reply] dispatch failed:', err)
   }
 }
+
 
 
 
