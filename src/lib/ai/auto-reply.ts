@@ -80,6 +80,7 @@ interface ParsedUmrahDetails {
   selectedZiyarats: string[] | null
   makkahHotelQuery: string | null
   madinahHotelQuery: string | null
+  hotelPreference: 'cheapest' | null
   specialRequirements: string | null
 }
 
@@ -397,6 +398,14 @@ function likelyUsefulUmrahAnswer(text: string): boolean {
   )
 }
 
+function latestHotelPreferenceFromMessages(messages: { role: string; content: string }[]): 'cheapest' | null {
+  return messages.some((message) =>
+    /\b(lower|cheaper|cheap|lowest|less rate|low rate|budget hotel|reduce price|reduce rate)\b/i.test(message.content),
+  )
+    ? 'cheapest'
+    : null
+}
+
 function parseUmrahDetails(messages: { role: string; content: string }[]): ParsedUmrahDetails {
   const detailMessages = umrahDetailMessages(messages)
   const userMessages = detailMessages.filter((message) => message.role === 'user')
@@ -467,6 +476,7 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     selectedZiyarats,
     makkahHotelQuery: latestHotelQueryFromMessages(userMessages, 'makkah'),
     madinahHotelQuery: latestHotelQueryFromMessages(userMessages, 'madinah'),
+    hotelPreference: latestHotelPreferenceFromMessages(userMessages),
     specialRequirements: parsedSpecialRequirements?.trim() ?? null,
   }
 
@@ -508,6 +518,7 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     selectedZiyarats: null,
     makkahHotelQuery: null,
     madinahHotelQuery: null,
+    hotelPreference: null,
     specialRequirements: specialRequirements?.trim() ?? null,
   }
 }
@@ -568,6 +579,9 @@ function normalizeAiUmrahDetails(raw: Record<string, unknown>): Partial<ParsedUm
     selectedZiyarats: stringArrayFromAi(raw.selectedZiyarats ?? raw.selected_ziyarats),
     makkahHotelQuery: stringValue(raw.makkahHotelQuery ?? raw.makkah_hotel ?? raw.makkahHotel),
     madinahHotelQuery: stringValue(raw.madinahHotelQuery ?? raw.madinaHotelQuery ?? raw.madinah_hotel ?? raw.madina_hotel),
+    hotelPreference: /\b(lower|cheaper|cheap|lowest|less rate|low rate|budget hotel|reduce price|reduce rate)\b/i.test(
+      stringValue(raw.hotelPreference ?? raw.hotel_preference ?? raw.specialRequirements ?? raw.special_requirements) ?? '',
+    ) ? 'cheapest' : null,
     specialRequirements: stringValue(raw.specialRequirements ?? raw.special_requirements),
   }
 }
@@ -591,6 +605,7 @@ function mergeUmrahDetails(base: ParsedUmrahDetails, ai: Partial<ParsedUmrahDeta
     selectedZiyarats: ai.selectedZiyarats ?? base.selectedZiyarats,
     makkahHotelQuery: ai.makkahHotelQuery ?? base.makkahHotelQuery,
     madinahHotelQuery: ai.madinahHotelQuery ?? base.madinahHotelQuery,
+    hotelPreference: ai.hotelPreference ?? base.hotelPreference,
     specialRequirements: ai.specialRequirements ?? base.specialRequirements,
   }
 }
@@ -610,7 +625,7 @@ async function extractUmrahDetailsWithAi(
     'Use null for unknown fields. Never invent unavailable details.',
     'Understand flexible wording: couple=2 adults, kids/children, babies/infants, "add staria" means vehicle Staria, "add badar and taif ziyarat" means selected ziyarats ["badar","taif"], "change Makkah hotel to voco" means makkahHotelQuery "voco".',
     'Normalize hotelCategory to Economy, Standard, or Executive. Normalize travelDate to yyyy-mm-dd when present. Use selectedZiyarats values from: makkah, madina, badar, taif.',
-    'Fields: budget, travelDate, days, makkahNights, madinahNights, adults, children, infants, elderly, hotelCategory, rooms, roomSharing, vehicle, ziyarat, selectedZiyarats, makkahHotelQuery, madinahHotelQuery, specialRequirements.',
+    'Fields: budget, travelDate, days, makkahNights, madinahNights, adults, children, infants, elderly, hotelCategory, rooms, roomSharing, vehicle, ziyarat, selectedZiyarats, makkahHotelQuery, madinahHotelQuery, hotelPreference, specialRequirements.',
   ].join('\n')
 
   try {
@@ -823,7 +838,7 @@ function buildCurrentUmrahQuote(
       room_type: roomSetup.roomType,
       hotel_category: normalizedUmrahHotelCategory(options.hotelCategory ?? details.hotelCategory),
       budget: details.budget ?? undefined,
-      hotel_preference: options.hotelPreference,
+      hotel_preference: options.hotelPreference ?? details.hotelPreference ?? 'cheapest',
       selected_hotels: selectedHotels,
       vehicle: details.vehicle ?? vehicle,
       include_visa: true,
@@ -1156,7 +1171,7 @@ async function buildAiUmrahReply(args: {
     }
 
     if (/\b(lower|cheaper|cheap|lowest|less rate|low rate|reduce price|reduce rate)\b/i.test(args.latestText) && /\b(hotel|package|rate|price)\b/i.test(args.latestText)) {
-      const lowerDetails = { ...details, hotelCategory: 'Economy' }
+      const lowerDetails = { ...details, hotelCategory: 'Economy', hotelPreference: 'cheapest' as const }
       const lowerQuote = buildCurrentUmrahQuote(lowerDetails, plannerData, {
         hotelCategory: 'Economy',
         hotelPreference: 'cheapest',
@@ -1171,6 +1186,21 @@ async function buildAiUmrahReply(args: {
         text: reply,
         document: await uploadUmrahQuotePdf({ db: args.db, accountId: args.accountId, quote: lowerQuote }) ?? undefined,
       }
+    }
+
+    if (
+      /\b(rate|price|total|quote|quotation|package)\b.{0,80}\b(include|included|includes|for|cover|covers)\b.{0,80}\b(all|people|persons|adults|travellers|travelers|pax)\b/i.test(args.latestText) ||
+      /\b(include|included|includes|cover|covers)\b.{0,80}\b(all|people|persons|adults|travellers|travelers|pax)\b/i.test(args.latestText)
+    ) {
+      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+      return [
+        `Yes, this estimated total is for ${quote.travelers} traveler${quote.travelers === 1 ? '' : 's'}.`,
+        `It is calculated for ${quote.rooms} x ${quote.roomType} room, ${quote.vehicle} transport, visa, and the selected hotels shown in the quotation.`,
+        quote.ziyarats.length
+          ? `Ziyarat included: ${quote.ziyarats.map((item) => item.name).join(', ')}.`
+          : 'Ziyarat is not included in this quotation.',
+        `Estimated total: ${quote.priceText}.`,
+      ].join('\n')
     }
 
     if (/\b(which|what).{0,40}\b(vehicle|transport|car)\b|\b(vehicle|transport).{0,40}\bwith us\b/i.test(args.latestText)) {

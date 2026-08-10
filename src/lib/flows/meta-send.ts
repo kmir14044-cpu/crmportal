@@ -243,7 +243,6 @@ export async function engineSendMedia(
     content_type: args.kind,
     content_text: args.caption ?? null,
     media_url: args.link,
-    filename: args.filename ?? null,
     message_id: waMessageId,
     status: 'sent',
   })
