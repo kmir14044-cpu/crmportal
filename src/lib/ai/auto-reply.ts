@@ -5,7 +5,9 @@ import { retrieveKnowledge } from './knowledge'
 import { generateReply } from './generate'
 import { buildSystemPrompt } from './defaults'
 import { latestUserMessage } from './query'
-import { engineSendMedia, engineSendText } from '@/lib/flows/meta-send'
+import { engineSendText } from '@/lib/flows/meta-send'
+import { decrypt } from '@/lib/whatsapp/encryption'
+import { sanitizePhoneForMeta, isValidE164, phoneVariants, isRecipientNotAllowedError } from '@/lib/whatsapp/phone-utils'
 import { loadUmrahPlannerDataForAccount, quoteUmrah } from '@/lib/umrah-planner/quote'
 import type { UmrahQuoteResult } from '@/lib/umrah-planner/quote'
 import { buildUmrahQuotePdf } from '@/lib/umrah-planner/pdf'
@@ -95,7 +97,10 @@ interface DispatchArgs {
 }
 
 interface AiReplyDocument {
+  /** Stored Supabase URL for CRM/history only. WhatsApp delivery does not use this URL. */
   link: string
+  /** Exact generated PDF bytes; uploaded directly to Meta before sending. */
+  bytes: Uint8Array
   filename: string
   caption?: string
 }
@@ -985,9 +990,175 @@ async function uploadUmrahQuotePdf(args: {
 
   return {
     link: data.publicUrl,
+    bytes: pdf,
     filename: 'Umrah Quotation.pdf',
     caption: 'Your Umrah quotation PDF is attached.',
   }
+}
+
+const META_API_VERSION = process.env.META_API_VERSION || 'v21.0'
+const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
+
+async function metaErrorText(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = await response.json() as { error?: { message?: string; code?: number; error_subcode?: number } }
+    if (payload.error?.message) {
+      return `${payload.error.message}${payload.error.code ? ` (code ${payload.error.code}${payload.error.error_subcode ? `/${payload.error.error_subcode}` : ''})` : ''}`
+    }
+  } catch {
+    // Keep the HTTP fallback when Meta did not return JSON.
+  }
+  return fallback
+}
+
+/**
+ * Auto-reply-owned PDF sender.
+ *
+ * There is intentionally ONE document delivery path for Umrah quotations:
+ *   generated PDF bytes -> Meta /media -> media_id -> Meta /messages.
+ *
+ * The Supabase URL is retained only for CRM history (`messages.media_url`).
+ * It is never used by Meta to fetch the PDF.
+ */
+async function sendUmrahQuotePdfDirect(args: {
+  db: AdminClient
+  accountId: string
+  conversationId: string
+  contactId: string
+  document: AiReplyDocument
+}): Promise<{ whatsapp_message_id: string }> {
+  const { data: contact, error: contactErr } = await args.db
+    .from('contacts')
+    .select('id, phone')
+    .eq('id', args.contactId)
+    .eq('account_id', args.accountId)
+    .maybeSingle()
+  if (contactErr || !contact?.phone) {
+    throw new Error('contact not found for this account')
+  }
+
+  const sanitized = sanitizePhoneForMeta(contact.phone)
+  if (!isValidE164(sanitized)) {
+    throw new Error(`contact phone invalid: ${contact.phone}`)
+  }
+
+  const { data: config, error: configErr } = await args.db
+    .from('whatsapp_config')
+    .select('phone_number_id, access_token')
+    .eq('account_id', args.accountId)
+    .single()
+  if (configErr || !config?.phone_number_id || !config?.access_token) {
+    throw new Error('WhatsApp not configured for this account')
+  }
+
+  const accessToken = decrypt(config.access_token)
+  const pdfBody = args.document.bytes.buffer.slice(
+    args.document.bytes.byteOffset,
+    args.document.bytes.byteOffset + args.document.bytes.byteLength,
+  ) as ArrayBuffer
+
+  // Step 1: upload the actual generated PDF bytes to WhatsApp Cloud API.
+  const form = new FormData()
+  form.append('messaging_product', 'whatsapp')
+  form.append('type', 'application/pdf')
+  form.append('file', new Blob([pdfBody], { type: 'application/pdf' }), args.document.filename)
+
+  const uploadResponse = await fetch(`${META_API_BASE}/${config.phone_number_id}/media`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}` },
+    body: form,
+  })
+  if (!uploadResponse.ok) {
+    throw new Error(await metaErrorText(
+      uploadResponse,
+      `Meta PDF upload failed: HTTP ${uploadResponse.status}`,
+    ))
+  }
+  const uploadData = await uploadResponse.json() as { id?: string }
+  if (!uploadData.id) {
+    throw new Error('Meta PDF upload succeeded but no media id was returned')
+  }
+
+  // Step 2: send the uploaded media id. Retry only recipient-format failures.
+  const attempt = async (phone: string): Promise<string> => {
+    const sendResponse = await fetch(`${META_API_BASE}/${config.phone_number_id}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: phone,
+        type: 'document',
+        document: {
+          id: uploadData.id,
+          filename: args.document.filename,
+          ...(args.document.caption ? { caption: args.document.caption } : {}),
+        },
+      }),
+    })
+    if (!sendResponse.ok) {
+      throw new Error(await metaErrorText(
+        sendResponse,
+        `Meta PDF send failed: HTTP ${sendResponse.status}`,
+      ))
+    }
+    const sendData = await sendResponse.json() as { messages?: Array<{ id?: string }> }
+    const messageId = sendData.messages?.[0]?.id
+    if (!messageId) throw new Error('Meta PDF send succeeded but no message id was returned')
+    return messageId
+  }
+
+  const variants = phoneVariants(sanitized)
+  let workingPhone = sanitized
+  let waMessageId = ''
+  let lastError: unknown = null
+
+  for (const phone of variants) {
+    try {
+      waMessageId = await attempt(phone)
+      workingPhone = phone
+      lastError = null
+      break
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      if (!isRecipientNotAllowedError(message)) throw err
+      lastError = err
+    }
+  }
+  if (lastError) throw lastError
+  if (!waMessageId) throw new Error('Meta PDF send returned no WhatsApp message id')
+
+  if (workingPhone !== sanitized) {
+    await args.db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+  }
+
+  // Keep the CRM inbox/history in sync with the document that actually went to Meta.
+  const { error: msgErr } = await args.db.from('messages').insert({
+    conversation_id: args.conversationId,
+    sender_type: 'bot',
+    content_type: 'document',
+    content_text: args.document.caption ?? null,
+    media_url: args.document.link,
+    message_id: waMessageId,
+    status: 'sent',
+  })
+  if (msgErr) {
+    throw new Error(`PDF sent to Meta but DB insert failed: ${msgErr.message}`)
+  }
+
+  await args.db
+    .from('conversations')
+    .update({
+      last_message_text: args.document.caption?.trim() || '[document]',
+      last_message_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', args.conversationId)
+
+  return { whatsapp_message_id: waMessageId }
 }
 
 function umrahLeadNotes(details: ParsedUmrahDetails, latestText: string): string {
@@ -1622,27 +1793,18 @@ export async function dispatchInboundToAiReply(
         text: replyText,
       })
       const document = typeof umrahReply === 'string' ? null : umrahReply.document
-      if (document?.link) {
+      if (document) {
         try {
-          await engineSendMedia({
+          await sendUmrahQuotePdfDirect({
+            db,
             accountId,
-            userId: configOwnerUserId,
             conversationId,
             contactId,
-            kind: 'document',
-            link: document.link,
-            filename: document.filename,
-            caption: document.caption,
+            document,
           })
         } catch (err) {
-          console.error('[ai auto-reply] quote PDF document send failed:', err)
-          await engineSendText({
-            accountId,
-            userId: configOwnerUserId,
-            conversationId,
-            contactId,
-            text: `Your Umrah quotation PDF is ready:\n${document.link}`,
-          })
+          // No URL fallback and no alternate media sender: one PDF path only.
+          console.error('[ai auto-reply] direct Meta quote PDF send failed:', err)
         }
       }
       return
