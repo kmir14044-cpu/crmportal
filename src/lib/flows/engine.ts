@@ -40,18 +40,13 @@ import {
   engineSendText,
 } from "./meta-send";
 import { decideFallback, resolveFallbackPolicy } from "./fallback";
-import { normalizeFlowInput } from "./normalize-input";
-import { parseUmrahBulkMessage } from "./umrah-bulk-intake";
 import { quoteTrip } from "@/lib/trip-planner/quote";
-import { loadUmrahPlannerDataForAccount, quoteUmrah, type UmrahQuoteInput, type UmrahQuoteResult } from "@/lib/umrah-planner/quote";
-import { saveUmrahQuoteSession } from "@/lib/umrah-planner/quote-session";
-import { loadUmrahDynamicOptions } from "./umrah-dynamic-options";
+import { loadUmrahPlannerDataForAccount, quoteUmrah } from "@/lib/umrah-planner/quote";
 import {
   type CollectInputNodeConfig,
   type ConditionNodeConfig,
   type DispatchInboundInput,
   type DispatchInboundResult,
-  type DynamicUmrahListNodeConfig,
   type FlowNodeRow,
   type FlowRow,
   type FlowRunRow,
@@ -79,6 +74,9 @@ export function matchReplyId(
   node: { node_type: string; config: Record<string, unknown> },
   reply_id: string,
 ): string | null {
+  const dynamicNext = dynamicReplyNext(node, reply_id);
+  if (dynamicNext) return dynamicNext;
+
   if (node.node_type === "send_buttons") {
     const cfg = node.config as unknown as SendButtonsNodeConfig;
     const hit = cfg.buttons?.find((b) => b.reply_id === reply_id);
@@ -95,10 +93,39 @@ export function matchReplyId(
   return null;
 }
 
+function dynamicReplyNext(
+  node: { node_type: string; config: Record<string, unknown> },
+  replyId: string,
+): string | null {
+  const cfg = node.config as Record<string, unknown>;
+  const source = String(cfg.dynamic_source ?? "");
+  if (!source || !replyId.startsWith("dyn:")) return null;
+  const parts = replyId.split(":");
+
+  if (source === "umrah_hotels") {
+    const action = parts[1];
+    if (action === "hotel_page") return String(cfg.next_node_key ?? "");
+    if (action === "hotel") return String(cfg.next_after_select ?? cfg.next_node_key ?? "");
+  }
+  if (source === "umrah_ziyarats") {
+    const action = parts[1];
+    if (action === "ziyarat_done" || action === "ziyarat_none") {
+      return String(cfg.next_after_done ?? cfg.next_node_key ?? "");
+    }
+    if (action === "ziyarat") return String(cfg.next_node_key ?? "");
+  }
+
+  return null;
+}
+
 function interactiveVarPatch(
   node: { node_type: string; config: Record<string, unknown> },
   reply_id: string,
+  vars: Record<string, unknown> = {},
 ): Record<string, string> {
+  const dynamicPatch = dynamicInteractiveVarPatch(node, reply_id, vars);
+  if (dynamicPatch) return dynamicPatch;
+
   if (node.node_type === "send_buttons") {
     const cfg = node.config as unknown as SendButtonsNodeConfig;
     const hit = cfg.buttons?.find((b) => b.reply_id === reply_id);
@@ -112,6 +139,47 @@ function interactiveVarPatch(
     }
   }
   return {};
+}
+
+function dynamicInteractiveVarPatch(
+  node: { node_type: string; config: Record<string, unknown> },
+  replyId: string,
+  vars: Record<string, unknown>,
+): Record<string, string> | null {
+  const cfg = node.config as Record<string, unknown>;
+  const source = String(cfg.dynamic_source ?? "");
+  if (!source || !replyId.startsWith("dyn:")) return null;
+  const parts = replyId.split(":");
+
+  if (source === "umrah_hotels") {
+    const action = parts[1];
+    const city = decodeURIComponent(parts[2] ?? "");
+    const stopIndex = parts[3] ?? "0";
+    if (action === "hotel_page") {
+      return { [`umrah_hotel_page_${city}_${stopIndex}`]: parts[4] ?? "0" };
+    }
+    if (action === "hotel") {
+      return {
+        [`umrah_hotel_${city}_${stopIndex}`]: decodeURIComponent(parts.slice(4).join(":")),
+      };
+    }
+  }
+
+  if (source === "umrah_ziyarats") {
+    const action = parts[1];
+    if (action === "ziyarat_none") return { umrah_selected_ziyarats: "" };
+    if (action === "ziyarat_done") return {};
+    if (action === "ziyarat") {
+      const id = decodeURIComponent(parts.slice(2).join(":"));
+      const existing = String(vars.umrah_selected_ziyarats ?? "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      return { umrah_selected_ziyarats: [...new Set([...existing, id])].join(",") };
+    }
+  }
+
+  return null;
 }
 
 function escapeRegExp(value: string): string {
@@ -197,7 +265,6 @@ export function isSuspending(node_type: string): boolean {
   return (
     node_type === "send_buttons" ||
     node_type === "send_list" ||
-    node_type === "dynamic_umrah_list" ||
     node_type === "collect_input"
   );
 }
@@ -317,13 +384,12 @@ interface UmrahPlannerDetails {
   rooms: string;
   room_type: string;
   hotel_category: string;
+  selected_hotels?: Record<string, string>;
   vehicle: string;
   transport_mode: "full" | "selective";
   include_visa: boolean;
   include_ziyarat: boolean;
-  selected_hotels: Record<string, string>;
-  selected_sectors: string[];
-  selected_ziyarats: string[];
+  selected_ziyarats?: string[];
   query: string;
 }
 
@@ -532,67 +598,6 @@ async function findEntryFlow(
 // thread can quote the prompt the customer is replying to.
 // ============================================================
 
-
-function dynamicReplyId(nodeKey: string, action: "select" | "finish" | "none" | "next" | "prev", value = ""): string {
-  return `udyn:${nodeKey}:${action}:${encodeURIComponent(value)}`.slice(0, 200);
-}
-
-function parseDynamicReplyId(replyId: string): { nodeKey: string; action: string; value: string } | null {
-  const match = replyId.match(/^udyn:([^:]+):(select|finish|none|next|prev):(.*)$/);
-  if (!match) return null;
-  return { nodeKey: match[1], action: match[2], value: decodeURIComponent(match[3] || "") };
-}
-
-async function sendDynamicUmrahListAndSuspend(
-  db: AdminClient,
-  run: FlowRunRow,
-  node: FlowNodeRow,
-): Promise<void> {
-  const cfg = node.config as unknown as DynamicUmrahListNodeConfig;
-  const pageVar = `__dynamic_page_${node.node_key}`;
-  const page = Math.max(0, Number(run.vars[pageVar] ?? 0) || 0);
-  const all = await loadUmrahDynamicOptions({
-    db,
-    accountId: run.account_id,
-    source: cfg.source,
-    vars: run.vars,
-  });
-  const pageSize = Math.min(8, Math.max(1, cfg.page_size ?? 7));
-  const start = page * pageSize;
-  const visible = all.slice(start, start + pageSize);
-  const rows = visible.map((option) => ({
-    id: dynamicReplyId(node.node_key, "select", option.value),
-    title: option.title.slice(0, 24),
-    description: option.description?.slice(0, 72),
-  }));
-  if (cfg.selection_mode === "multiple") {
-    rows.push({ id: dynamicReplyId(node.node_key, "finish"), title: "Finish selection", description: "Continue with selected items" });
-  }
-  if (cfg.allow_none) {
-    rows.push({ id: dynamicReplyId(node.node_key, "none"), title: "None", description: "Clear selection and continue" });
-  }
-  if (start + pageSize < all.length && rows.length < 10) {
-    rows.push({ id: dynamicReplyId(node.node_key, "next"), title: "Next page", description: `More ${cfg.source.replaceAll("_", " ")}` });
-  } else if (page > 0 && rows.length < 10) {
-    rows.push({ id: dynamicReplyId(node.node_key, "prev"), title: "Previous page", description: "Go back" });
-  }
-  if (!visible.length && !rows.length) {
-    await engineSendText({ accountId: run.account_id, userId: run.user_id, conversationId: run.conversation_id!, contactId: run.contact_id!, text: "No matching options are currently available. Our team will confirm this manually." });
-    return;
-  }
-  await engineSendInteractiveList({
-    accountId: run.account_id,
-    userId: run.user_id,
-    conversationId: run.conversation_id!,
-    contactId: run.contact_id!,
-    bodyText: interpolateVars(cfg.text, run.vars),
-    buttonLabel: cfg.button_label,
-    headerText: cfg.header_text,
-    footerText: cfg.footer_text,
-    sections: [{ title: "Available options", rows }],
-  });
-}
-
 async function sendButtonsAndSuspend(
   db: AdminClient,
   run: FlowRunRow,
@@ -634,7 +639,7 @@ async function sendListAndSuspend(
   run: FlowRunRow,
   node: FlowNodeRow,
 ): Promise<{ outcome: "advanced"; node_key: string }> {
-  const cfg = node.config as unknown as SendListNodeConfig;
+  const cfg = await resolveSendListConfig(db, run, node);
   const { whatsapp_message_id } = await engineSendInteractiveList({
     accountId: run.account_id,
     userId: run.user_id,
@@ -669,6 +674,122 @@ async function sendListAndSuspend(
     })
     .eq("id", run.id);
   return { outcome: "advanced", node_key: node.node_key };
+}
+
+async function resolveSendListConfig(
+  db: AdminClient,
+  run: FlowRunRow,
+  node: FlowNodeRow,
+): Promise<SendListNodeConfig> {
+  const cfg = node.config as unknown as SendListNodeConfig & Record<string, unknown>;
+  if (cfg.dynamic_source === "umrah_hotels") {
+    return buildDynamicUmrahHotelList(db, run, cfg);
+  }
+  if (cfg.dynamic_source === "umrah_ziyarats") {
+    return buildDynamicUmrahZiyaratList(db, run, cfg);
+  }
+  return cfg;
+}
+
+function cleanListTitle(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 24) || "Option";
+}
+
+function cleanListDescription(value: string): string {
+  return value.replace(/\s+/g, " ").trim().slice(0, 72);
+}
+
+function dataRows(data: Record<string, unknown>, key: string): Array<Record<string, unknown>> {
+  const value = data[key];
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object" && !Array.isArray(item)))
+    : [];
+}
+
+function normCity(value: unknown): string {
+  return String(value ?? "").replace(/Madinah/g, "Madina").trim().toLowerCase();
+}
+
+async function buildDynamicUmrahHotelList(
+  db: AdminClient,
+  run: FlowRunRow,
+  cfg: SendListNodeConfig & Record<string, unknown>,
+): Promise<SendListNodeConfig> {
+  const data = await loadUmrahPlannerDataForAccount(db, run.account_id);
+  const city = String(cfg.city || "Makkah");
+  const stopIndex = String(cfg.stop_index ?? "0");
+  const categoryValue = firstVar(run.vars, ["umrah_hotel_category", "hotel_category"]) || "Economy";
+  const pageKey = `umrah_hotel_page_${city}_${stopIndex}`;
+  const page = Math.max(0, Number.parseInt(String(run.vars[pageKey] ?? "0"), 10) || 0);
+  const pageSize = 9;
+  const hotels = dataRows(data, "hotels")
+    .filter((hotel) => normCity(hotel.city) === normCity(city))
+    .filter((hotel) => !categoryValue || normalizedLabel(String(hotel.category ?? "")) === normalizedLabel(categoryValue))
+    .sort((a, b) => String(a.name ?? "").localeCompare(String(b.name ?? "")));
+  const start = page * pageSize;
+  const rows = hotels.slice(start, start + pageSize).map((hotel) => ({
+    reply_id: `dyn:hotel:${encodeURIComponent(city)}:${stopIndex}:${encodeURIComponent(String(hotel.id ?? ""))}`,
+    title: cleanListTitle(String(hotel.name ?? "Hotel")),
+    description: cleanListDescription([
+      hotel.distance ? String(hotel.distance) : "",
+      hotel.meal ? `Meal ${hotel.meal}` : "",
+    ].filter(Boolean).join(" | ")),
+    next_node_key: String(cfg.next_after_select ?? cfg.next_node_key ?? ""),
+  }));
+  if (start + pageSize < hotels.length) {
+    rows.push({
+      reply_id: `dyn:hotel_page:${encodeURIComponent(city)}:${stopIndex}:${page + 1}`,
+      title: "More hotels",
+      description: `Show more ${city} hotels`,
+      next_node_key: String(cfg.next_node_key ?? ""),
+    });
+  }
+  if (!rows.length) {
+    rows.push({
+      reply_id: `dyn:hotel:${encodeURIComponent(city)}:${stopIndex}:`,
+      title: "Hotel pending",
+      description: "No matching hotel in portal",
+      next_node_key: String(cfg.next_after_select ?? cfg.next_node_key ?? ""),
+    });
+  }
+  return {
+    text: String(cfg.text || `${city} Hotel`),
+    button_label: String(cfg.button_label || "Choose hotel").slice(0, 20),
+    sections: [{ title: cleanListTitle(`${city} hotels`), rows }],
+  };
+}
+
+async function buildDynamicUmrahZiyaratList(
+  db: AdminClient,
+  run: FlowRunRow,
+  cfg: SendListNodeConfig & Record<string, unknown>,
+): Promise<SendListNodeConfig> {
+  const data = await loadUmrahPlannerDataForAccount(db, run.account_id);
+  const selected = String(run.vars.umrah_selected_ziyarats ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const rows = [
+    {
+      reply_id: "dyn:ziyarat_done",
+      title: selected.length ? "Done" : "None",
+      description: selected.length ? `${selected.length} selected` : "No ziyarat",
+      next_node_key: String(cfg.next_after_done ?? cfg.next_node_key ?? ""),
+    },
+    ...dataRows(data, "ziyarats").slice(0, 8).map((item) => ({
+      reply_id: `dyn:ziyarat:${encodeURIComponent(String(item.id ?? ""))}`,
+      title: cleanListTitle(String(item.name ?? item.id ?? "Ziyarat")),
+      description: selected.includes(String(item.id ?? "")) ? "Selected" : "Tap to add",
+      next_node_key: String(cfg.next_node_key ?? ""),
+    })),
+  ];
+  return {
+    text: selected.length
+      ? `Ziyarat\nSelected: ${selected.join(", ")}\nAdd another or tap Done.`
+      : String(cfg.text || "Ziyarat"),
+    button_label: String(cfg.button_label || "Choose ziyarat").slice(0, 20),
+    sections: [{ title: "Ziyarats", rows }],
+  };
 }
 
 async function executeHandoff(
@@ -1053,66 +1174,6 @@ function routePresetFromValue(value: string): string {
   return "mk-md";
 }
 
-
-function buildSelectedHotelsForRoute(
-  routePresetId: string,
-  makkahHotelId: string,
-  madinahHotelId: string,
-): Record<string, string> {
-  const selected: Record<string, string> = {};
-  const add = (key: string, value: string) => {
-    if (value) selected[key] = value;
-  };
-
-  switch (routePresetId) {
-    case "md-mk":
-      add("Madinah-0", madinahHotelId);
-      add("Makkah-1", makkahHotelId);
-      break;
-    case "mk-md-mk":
-      add("Makkah-0", makkahHotelId);
-      add("Madinah-1", madinahHotelId);
-      add("Makkah-2", makkahHotelId);
-      break;
-    case "md-mk-md":
-      add("Madinah-0", madinahHotelId);
-      add("Makkah-1", makkahHotelId);
-      add("Madinah-2", madinahHotelId);
-      break;
-    case "mk-md":
-    default:
-      add("Makkah-0", makkahHotelId);
-      add("Madinah-1", madinahHotelId);
-      break;
-  }
-  return selected;
-}
-
-function stringArrayFromVars(
-  vars: Record<string, unknown>,
-  keys: string[],
-): string[] {
-  for (const key of keys) {
-    const value = vars[key];
-    if (Array.isArray(value)) {
-      return value.map(String).map((item) => item.trim()).filter(Boolean);
-    }
-    if (typeof value === "string" && value.trim()) {
-      const raw = value.trim();
-      try {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          return parsed.map(String).map((item) => item.trim()).filter(Boolean);
-        }
-      } catch {
-        // Dynamic list selections may be persisted as comma-separated text.
-      }
-      return raw.split(",").map((item) => item.trim()).filter(Boolean);
-    }
-  }
-  return [];
-}
-
 function buildUmrahPlannerDetails(args: {
   contact: Record<string, unknown> | null;
   name: string;
@@ -1129,19 +1190,28 @@ function buildUmrahPlannerDetails(args: {
   const route = firstVar(args.vars, ["umrah_route", "route", "route_preset_id"]);
   const phone = firstVar(args.vars, ["phone", "whatsapp_number", "customer_phone"]);
   const transportMode = firstVar(args.vars, ["umrah_transport_mode", "transport_mode"]);
-  const routePresetId = routePresetFromValue(route);
-  const selectedHotels = buildSelectedHotelsForRoute(
-    routePresetId,
-    firstVar(args.vars, ["umrah_makkah_hotel_id"]),
-    firstVar(args.vars, ["umrah_madinah_hotel_id"]),
-  );
+  const selectedHotels: Record<string, string> = {};
+  for (const [key, value] of Object.entries(args.vars)) {
+    const match = key.match(/^umrah_hotel_(Makkah|Madina|Madinah)_(\d+)$/);
+    if (match && typeof value === "string" && value.trim()) {
+      const city = match[1] === "Madinah" ? "Madinah" : match[1];
+      selectedHotels[`${city}-${match[2]}`] = value.trim();
+      selectedHotels[`${city}-0`] ??= value.trim();
+      selectedHotels[`${city}-1`] ??= value.trim();
+      selectedHotels[`${city}-2`] ??= value.trim();
+    }
+  }
+  const selectedZiyarats = String(args.vars.umrah_selected_ziyarats ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 
   return {
     name: args.name || contactName || "WhatsApp lead",
     email: args.email || contactEmail,
     phone: phone || contactPhone,
     start_date: firstVar(args.vars, ["umrah_start_date", "start_date", "travel_date"]),
-    route_preset_id: routePresetId,
+    route_preset_id: routePresetFromValue(route),
     nights: firstVar(args.vars, ["umrah_nights", "nights", "number_of_nights", "days"]) || "6",
     adults: firstVar(args.vars, ["umrah_adults", "adults"]) || "2",
     children: firstVar(args.vars, ["umrah_children", "children"]) || "0",
@@ -1149,21 +1219,12 @@ function buildUmrahPlannerDetails(args: {
     rooms: firstVar(args.vars, ["umrah_rooms", "rooms", "number_of_rooms"]) || "1",
     room_type: firstVar(args.vars, ["umrah_room_type", "room_type"]) || "Double",
     hotel_category: firstVar(args.vars, ["umrah_hotel_category", "hotel_category", "hotel"]) || "Economy",
+    selected_hotels: Object.keys(selectedHotels).length ? selectedHotels : undefined,
     vehicle: firstVar(args.vars, ["umrah_vehicle", "vehicle", "transport_type", "transport"]) || "Car",
     transport_mode: transportMode === "selective" ? "selective" : "full",
     include_visa: boolFromVar(firstVar(args.vars, ["umrah_include_visa", "include_visa"]), true),
-    include_ziyarat: boolFromVar(firstVar(args.vars, ["umrah_include_ziyarat", "include_ziyarat"]), false),
-    selected_hotels: selectedHotels,
-    selected_sectors: stringArrayFromVars(args.vars, [
-      "umrah_selected_transport_sector_ids",
-      "umrah_selected_sectors",
-      "selected_sectors",
-    ]),
-    selected_ziyarats: stringArrayFromVars(args.vars, [
-      "umrah_selected_ziyarat_ids",
-      "umrah_selected_ziyarats",
-      "selected_ziyarats",
-    ]),
+    include_ziyarat: selectedZiyarats.length > 0 || boolFromVar(firstVar(args.vars, ["umrah_include_ziyarat", "include_ziyarat"]), false),
+    selected_ziyarats: selectedZiyarats.length ? selectedZiyarats : undefined,
     query: args.query || firstVar(args.vars, ["umrah_query", "query", "requirement"]),
   };
 }
@@ -1678,22 +1739,7 @@ async function persistLeadCapture(db: AdminClient, run: FlowRunRow): Promise<voi
         console.error("[flows] trip designer WhatsApp reply failed:", err);
       }
     }
-    if (umrahPlannerQuote?.whatsappText && umrahPlannerDetails) {
-      try {
-        await saveUmrahQuoteSession(
-          db,
-          {
-            accountId: run.account_id,
-            userId: run.user_id,
-            contactId: run.contact_id,
-            conversationId: run.conversation_id,
-          },
-          umrahPlannerDetails as UmrahQuoteInput,
-          umrahPlannerQuote as UmrahQuoteResult,
-        );
-      } catch (err) {
-        console.error("[flows] saving Umrah quote session failed:", err);
-      }
+    if (umrahPlannerQuote?.whatsappText) {
       try {
         await engineSendText({
           accountId: run.account_id,
@@ -1988,12 +2034,6 @@ async function advanceFromNodeKey(
       currentKey = flow.entry_node_id;
       continue;
     }
-    if (node.node_type === "dynamic_umrah_list") {
-      await sendDynamicUmrahListAndSuspend(db, run, node);
-      const advanced = await advanceCurrentNodeKey(db, run.id, run.current_node_key, node.node_key);
-      if (!advanced) await logEvent(db, run.id, "error", node.node_key, { reason: "lost_race_during_advance" });
-      return { outcome: "advanced" };
-    }
     if (node.node_type === "send_buttons") {
       await sendButtonsAndSuspend(db, run, node);
       // Persist the new current_node_key via optimistic UPDATE.
@@ -2191,53 +2231,14 @@ async function handleReplyForActiveRun(
   //
   // Everything else falls through to the fallback policy below.
   let matched: string | null = null;
-  if (message.kind === "interactive_reply" && currentNode.node_type === "dynamic_umrah_list") {
-    const cfg = currentNode.config as unknown as DynamicUmrahListNodeConfig;
-    const parsed = parseDynamicReplyId(message.reply_id);
-    if (parsed?.nodeKey === currentNode.node_key) {
-      const pageVar = `__dynamic_page_${currentNode.node_key}`;
-      if (parsed.action === "next" || parsed.action === "prev") {
-        const page = Math.max(0, Number(run.vars[pageVar] ?? 0) || 0) + (parsed.action === "next" ? 1 : -1);
-        const newVars = { ...run.vars, [pageVar]: page };
-        await db.from("flow_runs").update({ vars: newVars }).eq("id", run.id);
-        run.vars = newVars;
-        await sendDynamicUmrahListAndSuspend(db, run, currentNode);
-        return { consumed: true, flow_run_id: run.id, outcome: "advanced" };
-      }
-      if (parsed.action === "none") {
-        const newVars = { ...run.vars, [cfg.output_var]: cfg.selection_mode === "multiple" ? [] : "", [pageVar]: 0 };
-        await db.from("flow_runs").update({ vars: newVars, reprompt_count: 0 }).eq("id", run.id);
-        run.vars = newVars;
-        matched = cfg.next_node_key;
-      } else if (parsed.action === "finish" && cfg.selection_mode === "multiple") {
-        matched = cfg.next_node_key;
-      } else if (parsed.action === "select" && parsed.value) {
-        if (cfg.selection_mode === "multiple") {
-          const current = Array.isArray(run.vars[cfg.output_var]) ? run.vars[cfg.output_var] as unknown[] : [];
-          const values = current.map(String);
-          const next = values.includes(parsed.value) ? values.filter((v) => v !== parsed.value) : [...values, parsed.value];
-          const newVars = { ...run.vars, [cfg.output_var]: next, [pageVar]: 0 };
-          await db.from("flow_runs").update({ vars: newVars, reprompt_count: 0 }).eq("id", run.id);
-          run.vars = newVars;
-          await engineSendText({ accountId: run.account_id, userId: run.user_id, conversationId: run.conversation_id!, contactId: run.contact_id!, text: `${values.includes(parsed.value) ? "Removed" : "Added"}. ${next.length} item(s) selected. Choose another option or tap Finish selection.` });
-          await sendDynamicUmrahListAndSuspend(db, run, currentNode);
-          return { consumed: true, flow_run_id: run.id, outcome: "advanced" };
-        }
-        const newVars = { ...run.vars, [cfg.output_var]: parsed.value, [pageVar]: 0 };
-        await db.from("flow_runs").update({ vars: newVars, reprompt_count: 0 }).eq("id", run.id);
-        run.vars = newVars;
-        matched = cfg.next_node_key;
-      }
-    }
-  } else if (
-
+  if (
     message.kind === "interactive_reply" &&
     (currentNode.node_type === "send_buttons" ||
       currentNode.node_type === "send_list")
   ) {
     matched = matchReplyId(currentNode, message.reply_id);
     if (matched) {
-      const patch = interactiveVarPatch(currentNode, message.reply_id);
+      const patch = interactiveVarPatch(currentNode, message.reply_id, run.vars);
       if (Object.keys(patch).length) {
         const newVars = { ...run.vars, ...patch };
         const { error } = await db
@@ -2258,76 +2259,11 @@ async function handleReplyForActiveRun(
     currentNode.node_type === "collect_input"
   ) {
     const cfg = currentNode.config as unknown as CollectInputNodeConfig;
-    const rawCaptured = message.text.trim();
-
-    if (rawCaptured.length > 0 && cfg.validation === "bulk_umrah_ai") {
-      const parsed = parseUmrahBulkMessage(rawCaptured, run.vars);
-      const isConfirmed = /^(confirm|confirmed|yes|proceed|generate|ok|okay)$/i.test(rawCaptured);
-      const looksLikeQuestion = /^(what|why|how|which|where|when|can|could|does|do|is|are|tell|explain)\b|\?$/i.test(rawCaptured);
-
-      // A question inside the Umrah intake should be answered by the normal AI
-      // responder while this collect_input node remains active. The next user
-      // message returns here and continues collecting the same session.
-      if (!isConfirmed && parsed.extractedKeys.length === 0 && looksLikeQuestion) {
-        await logEvent(db, run.id, "fallback_fired", currentNode.node_key, {
-          action: "delegate_question_to_ai",
-          reason: "no_structured_umrah_fields_extracted",
-        });
-        return { consumed: false, flow_run_id: run.id, outcome: "no_match" };
-      }
-
-      const newVars = { ...run.vars, ...parsed.fields };
-      await db.from("flow_runs").update({ vars: newVars, reprompt_count: 0 }).eq("id", run.id);
-      run.vars = newVars;
-
-      if (parsed.missing.length > 0) {
-        await engineSendText({
-          accountId: run.account_id,
-          userId: run.user_id,
-          conversationId: run.conversation_id!,
-          contactId: run.contact_id!,
-          text: parsed.prompt,
-        });
-        await logEvent(db, run.id, "fallback_fired", currentNode.node_key, {
-          action: "collect_missing_bulk_umrah",
-          missing: parsed.missing,
-        });
-        return { consumed: true, flow_run_id: run.id, outcome: "advanced" };
-      }
-
-      const awaitingConfirmation = Boolean(run.vars.__umrah_awaiting_confirmation);
-      if (!awaitingConfirmation || !isConfirmed) {
-        const confirmationVars = { ...newVars, __umrah_awaiting_confirmation: true };
-        await db.from("flow_runs").update({ vars: confirmationVars, reprompt_count: 0 }).eq("id", run.id);
-        run.vars = confirmationVars;
-        await engineSendText({
-          accountId: run.account_id,
-          userId: run.user_id,
-          conversationId: run.conversation_id!,
-          contactId: run.contact_id!,
-          text: parsed.confirmation,
-        });
-        await logEvent(db, run.id, "node_entered", currentNode.node_key, {
-          captured_keys: Object.keys(parsed.fields),
-          bulk_intake_complete: true,
-          awaiting_confirmation: true,
-        });
-        return { consumed: true, flow_run_id: run.id, outcome: "advanced" };
-      }
-
-      const confirmedVars = { ...newVars, __umrah_awaiting_confirmation: false };
-      await db.from("flow_runs").update({ vars: confirmedVars, reprompt_count: 0 }).eq("id", run.id);
-      run.vars = confirmedVars;
-      await logEvent(db, run.id, "node_entered", currentNode.node_key, {
-        bulk_intake_confirmed: true,
-      });
-      matched = cfg.next_node_key;
-    }
+    const captured = message.text.trim();
     if (
-      !matched &&
-      rawCaptured.length > 0 &&
+      captured.length > 0 &&
       (cfg.validation === "bulk_trip" || cfg.validation === "bulk_umrah") &&
-      !bulkDetailsLookComplete(rawCaptured, cfg.validation)
+      !bulkDetailsLookComplete(captured, cfg.validation)
     ) {
       await logEvent(db, run.id, "fallback_fired", currentNode.node_key, {
         action: "ignore",
@@ -2335,30 +2271,8 @@ async function handleReplyForActiveRun(
       });
       return { consumed: false, flow_run_id: run.id, outcome: "no_match" };
     }
-
-    let captured = rawCaptured;
-    if (!matched && cfg.ai_normalize && cfg.input_type && rawCaptured) {
-      const normalized = normalizeFlowInput({
-        inputType: cfg.input_type,
-        customerMessage: rawCaptured,
-      });
-      if (!normalized.matched || !normalized.value) {
-        // Let the normal AI responder answer genuine questions while
-        // keeping this flow suspended on the same field. If the text is
-        // simply an invalid value, the AI can explain the expected format.
-        await logEvent(db, run.id, "fallback_fired", currentNode.node_key, {
-          action: "ai_assist",
-          reason: normalized.reason ?? "normalization_failed",
-          expected_input_type: cfg.input_type,
-          validation_error: cfg.validation_error ?? null,
-        });
-        return { consumed: false, flow_run_id: run.id, outcome: "no_match" };
-      }
-      captured = normalized.value;
-    }
-
-    if (!matched && captured.length > 0 && cfg.var_key) {
-      // Persist normalized value + reset reprompt count atomically.
+    if (captured.length > 0 && cfg.var_key) {
+      // Persist captured value + reset reprompt count atomically.
       const newVars = { ...run.vars, [cfg.var_key]: captured };
       const { error: capErr } = await db
         .from("flow_runs")
@@ -2430,8 +2344,6 @@ async function handleReplyForActiveRun(
       await sendButtonsAndSuspend(db, run, currentNode);
     } else if (currentNode.node_type === "send_list") {
       await sendListAndSuspend(db, run, currentNode);
-    } else if (currentNode.node_type === "dynamic_umrah_list") {
-      await sendDynamicUmrahListAndSuspend(db, run, currentNode);
     } else if (currentNode.node_type === "collect_input") {
       // Customer typed something we couldn't accept (empty after trim,
       // or var_key missing — rare). Re-send the prompt so they try again.
@@ -2487,14 +2399,6 @@ async function startNewRun(
   // INSERT — partial unique index `idx_one_active_run_per_contact`
   // catches concurrent inserts with 23505. We catch and return as
   // consumed:true (the parallel webhook handles it).
-  const { data: contactRow } = await db
-    .from("contacts")
-    .select("phone")
-    .eq("id", input.contactId)
-    .eq("account_id", flow.account_id)
-    .maybeSingle();
-  const contactPhone = (contactRow as { phone?: string } | null)?.phone?.trim() ?? "";
-
   const { data: inserted, error: insErr } = await db
     .from("flow_runs")
     .insert({
@@ -2511,9 +2415,6 @@ async function startNewRun(
       conversation_id: input.conversationId,
       status: "active",
       current_node_key: flow.entry_node_id,
-      vars: contactPhone
-        ? { phone: contactPhone, whatsapp_number: contactPhone }
-        : {},
     })
     .select("*")
     .maybeSingle();

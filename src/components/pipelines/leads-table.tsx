@@ -22,8 +22,6 @@ const EXPORT_COLUMNS = [
   "Rooms",
   "Transport",
   "Query",
-  "Currency",
-  "Value",
   "Created At",
   "Notes",
 ];
@@ -135,8 +133,6 @@ function dealToLeadRow(deal: Deal, stages: PipelineStage[]) {
     rooms: firstFilled(deal.lead_rooms, extractDetail(notes, DETAIL_LABELS.rooms), parsedFromQuery.rooms),
     transport: firstFilled(deal.lead_transport, extractDetail(notes, DETAIL_LABELS.transport), parsedFromQuery.transport),
     query,
-    currency: deal.currency ?? "",
-    value: deal.value ?? 0,
     createdAt: deal.created_at,
     notes,
   };
@@ -183,8 +179,6 @@ export function LeadsTable({
         lead.rooms,
         lead.transport,
         lead.query,
-        lead.currency,
-        lead.value,
         lead.createdAt,
         lead.notes,
       ]

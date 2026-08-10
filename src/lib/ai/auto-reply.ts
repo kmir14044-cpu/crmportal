@@ -6,6 +6,7 @@ import { generateReply } from './generate'
 import { buildSystemPrompt } from './defaults'
 import { latestUserMessage } from './query'
 import { engineSendText } from '@/lib/flows/meta-send'
+import { loadUmrahPlannerDataForAccount, quoteUmrah } from '@/lib/umrah-planner/quote'
 
 type AdminClient = ReturnType<typeof supabaseAdmin>
 
@@ -34,6 +35,48 @@ const TRAVEL_INTENT_PATTERNS = [
   /\bgaliyat\b/i,
   /\bfairy\s+meadows\b/i,
 ]
+
+const UMRAH_INTAKE_MESSAGE = [
+  'Thank you for contacting us. To help us prepare a customized Umrah package for you, kindly share the following details:',
+  '',
+  '💰 Budget',
+  '📅 Travel Dates',
+  '🗓️ No. of Days',
+  '👥 No. of Travelers (Adults / Kids / Infants / Elderly with ages)',
+  '🏨 Hotel Category (Economy / Economy Plus / 4⭐ / 5⭐)',
+  '🛏️ No. of Hotel Rooms (Please mention room sharing)',
+  '🕌 Makkah & Madinah Ziyarat (Required / Not Required)',
+  '✈️ Special Requirements (Flight, transport, hotel distance, or any other preference)',
+  '',
+  "We'll share the best package according to your requirements. Thank you! 😊",
+].join('\n')
+
+const UMRAH_REQUIRED_FIELDS = [
+  'budget',
+  'travelDate',
+  'days',
+  'travelers',
+  'hotelCategory',
+  'rooms',
+  'ziyarat',
+] as const
+
+type UmrahRequiredField = (typeof UMRAH_REQUIRED_FIELDS)[number]
+
+interface ParsedUmrahDetails {
+  budget: string | null
+  travelDate: string | null
+  days: number | null
+  adults: number | null
+  children: number | null
+  infants: number | null
+  elderly: string | null
+  hotelCategory: string | null
+  rooms: number | null
+  roomSharing: string | null
+  ziyarat: boolean | null
+  specialRequirements: string | null
+}
 
 interface DispatchArgs {
   /** Tenancy key — drives config, contact, and whatsapp_config lookups. */
@@ -102,6 +145,117 @@ function looksLikeTravelDetailAnswer(text: string): boolean {
   return /\b(\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{4}|from\s+[a-z]|persons?|people|pax|passengers?|adults?|children|kids|days?|nights?|rooms?|budget|standard|deluxe|luxury|sedan|suv|hiace|coaster|coach)\b/i.test(
     text,
   )
+}
+
+function conversationText(messages: { role: string; content: string }[]): string {
+  return messages.map((message) => message.content).join('\n')
+}
+
+function parseDateText(text: string): string | null {
+  const iso = text.match(/\b(20\d{2}-\d{1,2}-\d{1,2})\b/)
+  if (iso) return iso[1]
+  const natural = text.match(
+    /\b(\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+20\d{2})\b/i,
+  )
+  return natural?.[1] ?? null
+}
+
+function parseBoolPreference(value: string): boolean | null {
+  if (/\b(not required|no|none|without|skip)\b/i.test(value)) return false
+  if (/\b(required|yes|include|needed|need)\b/i.test(value)) return true
+  return null
+}
+
+function parseUmrahDetails(messages: { role: string; content: string }[]): ParsedUmrahDetails {
+  const text = conversationText(messages)
+  const latest = [...messages].reverse().find((message) => message.role === 'user')?.content ?? ''
+  const budget = text.match(/\b(?:budget|range)\s*[:\-]?\s*(?:pkr|rs\.?|₨)?\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
+    ?? text.match(/\b(?:pkr|rs\.?|₨)\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
+    ?? null
+  const days = parseIntText(text.match(/\b(\d{1,3})\s*(?:days?|nights?)\b/i)?.[1])
+  const adults = parseIntText(text.match(/\b(\d{1,3})\s*(?:adults?|persons?|people|pax|passengers?)\b/i)?.[1])
+  const children = parseIntText(text.match(/\b(\d{1,3})\s*(?:kids?|children|child)\b/i)?.[1])
+  const infants = parseIntText(text.match(/\b(\d{1,3})\s*(?:infants?|babies|baby)\b/i)?.[1])
+  const rooms = parseIntText(text.match(/\b(\d{1,3})\s*(?:rooms?|room)\b/i)?.[1])
+  const hotelCategory =
+    text.match(/\b(economy plus|economy|4\s*⭐|4\s*star|four\s*star|5\s*⭐|5\s*star|five\s*star|standard|executive)\b/i)?.[1] ?? null
+  const ziyarat = parseBoolPreference(
+    text.match(/\b(?:ziyarat|ziyarats)\s*[:\-]?\s*([a-z\s/]+)\b/i)?.[1] ?? latest,
+  )
+  const elderly = text.match(/\b(?:elderly|senior)[^,\n.]*/i)?.[0] ?? null
+  const roomSharing = text.match(/\b(?:sharing|double|triple|quad|single)[^,\n.]*/i)?.[0] ?? null
+  const specialRequirements =
+    text.match(/\b(?:special requirements?|requirements?|preference)\s*[:\-]\s*([^\n]+)/i)?.[1] ??
+    text.match(/\b(flight|transport|near haram|walking distance|wheelchair|hotel distance)[^.\n]*/i)?.[0] ??
+    null
+
+  return {
+    budget: budget?.trim() ?? null,
+    travelDate: parseDateText(text),
+    days,
+    adults,
+    children,
+    infants,
+    elderly,
+    hotelCategory: hotelCategory ? titleCase(hotelCategory) : null,
+    rooms,
+    roomSharing,
+    ziyarat,
+    specialRequirements: specialRequirements?.trim() ?? null,
+  }
+}
+
+function missingUmrahFields(details: ParsedUmrahDetails): UmrahRequiredField[] {
+  return UMRAH_REQUIRED_FIELDS.filter((field) => {
+    if (field === 'travelers') return !details.adults && !details.children && !details.infants && !details.elderly
+    if (field === 'ziyarat') return details.ziyarat === null
+    return !details[field]
+  })
+}
+
+function formatMissingUmrahPrompt(missing: UmrahRequiredField[]): string {
+  const labels: Record<UmrahRequiredField, string> = {
+    budget: '💰 Budget',
+    travelDate: '📅 Travel Dates',
+    days: '🗓️ No. of Days',
+    travelers: '👥 No. of Travelers (Adults / Kids / Infants / Elderly with ages)',
+    hotelCategory: '🏨 Hotel Category (Economy / Economy Plus / 4⭐ / 5⭐)',
+    rooms: '🛏️ No. of Hotel Rooms (Please mention room sharing)',
+    ziyarat: '🕌 Makkah & Madinah Ziyarat (Required / Not Required)',
+  }
+  return [
+    'Thank you. I have noted your details.',
+    '',
+    'Please share the missing details below so we can prepare your Umrah package:',
+    '',
+    ...missing.map((field) => labels[field]),
+  ].join('\n')
+}
+
+function normalizedUmrahHotelCategory(value: string | null): string {
+  const text = value?.toLowerCase() ?? ''
+  if (text.includes('5') || text.includes('executive')) return 'Executive'
+  if (text.includes('4') || text.includes('plus') || text.includes('standard')) return 'Standard'
+  return 'Economy'
+}
+
+function umrahLeadNotes(details: ParsedUmrahDetails, latestText: string): string {
+  return [
+    'AI Umrah request from WhatsApp.',
+    details.budget ? `Budget: ${details.budget}` : null,
+    details.travelDate ? `Travel Dates: ${details.travelDate}` : null,
+    details.days ? `No. of Days: ${details.days}` : null,
+    details.adults !== null ? `Adults: ${details.adults}` : null,
+    details.children !== null ? `Kids: ${details.children}` : null,
+    details.infants !== null ? `Infants: ${details.infants}` : null,
+    details.elderly ? `Elderly: ${details.elderly}` : null,
+    details.hotelCategory ? `Hotel Category: ${details.hotelCategory}` : null,
+    details.rooms ? `Rooms: ${details.rooms}` : null,
+    details.roomSharing ? `Room Sharing: ${details.roomSharing}` : null,
+    details.ziyarat !== null ? `Ziyarat: ${details.ziyarat ? 'Required' : 'Not Required'}` : null,
+    details.specialRequirements ? `Special Requirements: ${details.specialRequirements}` : null,
+    `Latest customer message: ${latestText}`,
+  ].filter(Boolean).join('\n')
 }
 
 function parseAiLeadDetails(messages: { role: string; content: string }[], topic: string) {
@@ -200,6 +354,139 @@ async function ensureAiSalesPipeline(
   }
 
   return { pipelineId, stageId }
+}
+
+async function upsertAiUmrahLead(args: {
+  db: AdminClient
+  accountId: string
+  userId: string
+  conversationId: string
+  contactId: string
+  details: ParsedUmrahDetails
+  latestText: string
+  quoteText?: string | null
+}): Promise<void> {
+  const pipeline = await ensureAiSalesPipeline(args.db, args.accountId, args.userId)
+  if (!pipeline) return
+
+  const { data: existingDeals } = await args.db
+    .from('deals')
+    .select('id')
+    .eq('account_id', args.accountId)
+    .eq('contact_id', args.contactId)
+    .eq('pipeline_id', pipeline.pipelineId)
+    .eq('status', 'open')
+    .eq('lead_destination', 'Umrah')
+    .order('created_at', { ascending: false })
+    .limit(1)
+  const existingDeal = existingDeals?.[0] as { id: string } | undefined
+  const patch = compactLeadPatch({
+    lead_source: 'AI Umrah',
+    lead_destination: 'Umrah',
+    lead_trip_start_date: args.details.travelDate,
+    lead_days: args.details.days,
+    lead_hotel_category: args.details.hotelCategory,
+    lead_adults: args.details.adults,
+    lead_children: args.details.children ?? 0,
+    lead_rooms: args.details.rooms,
+    lead_transport: args.details.specialRequirements?.match(/\b(car|staria|gmc|hiace|coaster|shared shuttle|transport)\b/i)?.[1],
+    lead_query: [
+      args.details.budget ? `Budget: ${args.details.budget}` : null,
+      args.details.infants !== null ? `Infants: ${args.details.infants}` : null,
+      args.details.elderly ? `Elderly: ${args.details.elderly}` : null,
+      args.details.roomSharing ? `Room Sharing: ${args.details.roomSharing}` : null,
+      args.details.ziyarat !== null ? `Ziyarat: ${args.details.ziyarat ? 'Required' : 'Not Required'}` : null,
+      args.details.specialRequirements ? `Special Requirements: ${args.details.specialRequirements}` : null,
+    ].filter(Boolean).join('\n'),
+  })
+  const notes = [
+    umrahLeadNotes(args.details, args.latestText),
+    args.quoteText ? `\nGenerated Quote:\n${args.quoteText}` : null,
+  ].filter(Boolean).join('\n')
+
+  if (existingDeal?.id) {
+    await args.db
+      .from('deals')
+      .update({
+        title: `Umrah request - ${args.details.days ?? ''} days${args.details.travelDate ? ` - ${args.details.travelDate}` : ''}`.trim(),
+        conversation_id: args.conversationId,
+        notes,
+        ...patch,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', existingDeal.id)
+      .eq('account_id', args.accountId)
+    return
+  }
+
+  await args.db.from('deals').insert({
+    account_id: args.accountId,
+    user_id: args.userId,
+    pipeline_id: pipeline.pipelineId,
+    stage_id: pipeline.stageId,
+    contact_id: args.contactId,
+    conversation_id: args.conversationId,
+    title: `Umrah request - ${args.details.days ?? 'new'} days`,
+    value: 0,
+    currency: 'PKR',
+    ...patch,
+    notes,
+    status: 'open',
+  })
+}
+
+async function buildAiUmrahReply(args: {
+  db: AdminClient
+  accountId: string
+  userId: string
+  conversationId: string
+  contactId: string
+  latestText: string
+  messages: { role: string; content: string }[]
+}): Promise<string | null> {
+  const isUmrah = /\bumrah\b/i.test(conversationText(args.messages))
+  if (!isUmrah) return null
+
+  const alreadyAsked = args.messages.some((message) =>
+    message.role === 'assistant' && message.content.includes('customized Umrah package'),
+  )
+  const details = parseUmrahDetails(args.messages)
+  const missing = missingUmrahFields(details)
+
+  if (!alreadyAsked && missing.length > 0) {
+    await upsertAiUmrahLead({ ...args, details })
+    return UMRAH_INTAKE_MESSAGE
+  }
+
+  if (missing.length > 0) {
+    await upsertAiUmrahLead({ ...args, details })
+    return formatMissingUmrahPrompt(missing)
+  }
+
+  try {
+    const quote = quoteUmrah({
+      name: 'WhatsApp lead',
+      phone: '',
+      start_date: details.travelDate!,
+      route_preset_id: 'mk-md',
+      nights: details.days!,
+      adults: details.adults ?? 1,
+      children: details.children ?? 0,
+      infants: details.infants ?? 0,
+      rooms: details.rooms ?? 1,
+      room_type: details.roomSharing?.match(/\b(single|double|triple|quad)\b/i)?.[1] ?? 'Double',
+      hotel_category: normalizedUmrahHotelCategory(details.hotelCategory),
+      vehicle: details.specialRequirements?.match(/\b(shared shuttle|car|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car',
+      include_visa: true,
+      include_ziyarat: details.ziyarat ?? false,
+    }, await loadUmrahPlannerDataForAccount(args.db, args.accountId))
+    await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+    return quote.whatsappText
+  } catch (err) {
+    console.error('[ai auto-reply] umrah quote failed:', err)
+    await upsertAiUmrahLead({ ...args, details })
+    return 'Thank you. I have received your Umrah details. Our team will verify the latest hotel availability and share the final package shortly.'
+  }
 }
 
 async function captureAiTravelLead(args: {
@@ -397,6 +684,38 @@ export async function dispatchInboundToAiReply(
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return
     const latestText = latestUserMessage(messages)
+
+    const umrahReply = await buildAiUmrahReply({
+      db,
+      accountId,
+      userId: configOwnerUserId,
+      conversationId,
+      contactId,
+      latestText,
+      messages,
+    })
+    if (umrahReply) {
+      const { data: claimed, error: claimErr } = await db.rpc(
+        'claim_ai_reply_slot',
+        {
+          conversation_id: conversationId,
+          max_replies: config.autoReplyMaxPerConversation,
+        },
+      )
+      if (claimErr) {
+        console.error('[ai auto-reply] claim_ai_reply_slot failed:', claimErr)
+        return
+      }
+      if (claimed !== true) return
+      await engineSendText({
+        accountId,
+        userId: configOwnerUserId,
+        conversationId,
+        contactId,
+        text: umrahReply,
+      })
+      return
+    }
 
     // Ground the reply in the account's knowledge base (best-effort).
     const knowledge = await retrieveKnowledge(
