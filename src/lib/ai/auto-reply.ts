@@ -5,9 +5,10 @@ import { retrieveKnowledge } from './knowledge'
 import { generateReply } from './generate'
 import { buildSystemPrompt } from './defaults'
 import { latestUserMessage } from './query'
-import { engineSendText } from '@/lib/flows/meta-send'
+import { engineSendMedia, engineSendText } from '@/lib/flows/meta-send'
 import { loadUmrahPlannerDataForAccount, quoteUmrah } from '@/lib/umrah-planner/quote'
 import type { UmrahQuoteResult } from '@/lib/umrah-planner/quote'
+import { buildUmrahQuotePdf } from '@/lib/umrah-planner/pdf'
 import type { AiConfig } from './types'
 
 type AdminClient = ReturnType<typeof supabaseAdmin>
@@ -95,6 +96,14 @@ interface DispatchArgs {
    *  audit columns (mirrors how the flow runner passes it through). */
   configOwnerUserId: string
 }
+
+interface AiReplyDocument {
+  link: string
+  filename: string
+  caption?: string
+}
+
+type AiReplyPayload = string | { text: string; document?: AiReplyDocument }
 
 function travelLeadTopic(text: string): string | null {
   const normalized = text.trim().toLowerCase()
@@ -774,6 +783,49 @@ function buildCurrentUmrahQuote(
   }
 }
 
+async function uploadUmrahQuotePdf(args: {
+  db: AdminClient
+  accountId: string
+  quote: UmrahQuoteResult
+}): Promise<AiReplyDocument | null> {
+  const bucket = process.env.QUOTE_PDF_BUCKET || 'quotes'
+  const safeDate = args.quote.startDate.replace(/[^a-zA-Z0-9_-]+/g, '-')
+  const path = `account-${args.accountId}/umrah-${safeDate}-${Date.now()}.pdf`
+  const pdf = buildUmrahQuotePdf(args.quote)
+  const pdfBody = pdf.buffer.slice(pdf.byteOffset, pdf.byteOffset + pdf.byteLength) as ArrayBuffer
+  const { error: uploadError } = await args.db.storage
+    .from(bucket)
+    .upload(path, new Blob([pdfBody], { type: 'application/pdf' }), {
+      contentType: 'application/pdf',
+      cacheControl: '3600',
+      upsert: false,
+    })
+  if (uploadError) {
+    console.error('[ai auto-reply] quote PDF upload failed:', uploadError)
+    return null
+  }
+
+  const signed = await args.db.storage.from(bucket).createSignedUrl(path, 60 * 60 * 24)
+  if (signed.error || !signed.data?.signedUrl) {
+    const { data } = args.db.storage.from(bucket).getPublicUrl(path)
+    if (!data.publicUrl) {
+      console.error('[ai auto-reply] quote PDF URL failed:', signed.error)
+      return null
+    }
+    return {
+      link: data.publicUrl,
+      filename: 'Umrah Quotation.pdf',
+      caption: 'Your Umrah quotation PDF is attached.',
+    }
+  }
+
+  return {
+    link: signed.data.signedUrl,
+    filename: 'Umrah Quotation.pdf',
+    caption: 'Your Umrah quotation PDF is attached.',
+  }
+}
+
 function umrahLeadNotes(details: ParsedUmrahDetails, latestText: string): string {
   return [
     'AI Umrah request from WhatsApp.',
@@ -985,7 +1037,7 @@ async function buildAiUmrahReply(args: {
   config: AiConfig
   latestText: string
   messages: { role: string; content: string }[]
-}): Promise<string | null> {
+}): Promise<AiReplyPayload | null> {
   const isUmrah = /\bumrah\b/i.test(conversationText(args.messages))
   if (!isUmrah) return null
 
@@ -1073,7 +1125,10 @@ async function buildAiUmrahReply(args: {
         lowerQuote.whatsappText,
       ].join('\n')
       await upsertAiUmrahLead({ ...args, details: lowerDetails, quoteText: reply })
-      return reply
+      return {
+        text: reply,
+        document: await uploadUmrahQuotePdf({ db: args.db, accountId: args.accountId, quote: lowerQuote }) ?? undefined,
+      }
     }
 
     if (/\b(which|what).{0,40}\b(vehicle|transport|car)\b|\b(vehicle|transport).{0,40}\bwith us\b/i.test(args.latestText)) {
@@ -1107,7 +1162,10 @@ async function buildAiUmrahReply(args: {
         ].join('\n')
       : quote.whatsappText
     await upsertAiUmrahLead({ ...args, details, quoteText })
-    return quoteText
+    return {
+      text: quoteText,
+      document: await uploadUmrahQuotePdf({ db: args.db, accountId: args.accountId, quote }) ?? undefined,
+    }
   } catch (err) {
     console.error('[ai auto-reply] umrah quote failed:', err)
     await upsertAiUmrahLead({ ...args, details })
@@ -1334,13 +1392,27 @@ export async function dispatchInboundToAiReply(
         return
       }
       if (claimed !== true) return
+      const replyText = typeof umrahReply === 'string' ? umrahReply : umrahReply.text
       await engineSendText({
         accountId,
         userId: configOwnerUserId,
         conversationId,
         contactId,
-        text: umrahReply,
+        text: replyText,
       })
+      const document = typeof umrahReply === 'string' ? null : umrahReply.document
+      if (document?.link) {
+        await engineSendMedia({
+          accountId,
+          userId: configOwnerUserId,
+          conversationId,
+          contactId,
+          kind: 'document',
+          link: document.link,
+          filename: document.filename,
+          caption: document.caption,
+        })
+      }
       return
     }
 
