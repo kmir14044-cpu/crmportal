@@ -505,6 +505,38 @@ function availableUmrahHotelsText(data: Record<string, unknown>, categoryValue: 
   ].join('\n')
 }
 
+function availableUmrahZiyaratsText(data: Record<string, unknown>): string {
+  const ziyarats = plannerRows(data, 'ziyarats')
+    .map((item) => String(item.name ?? item.id ?? '').trim())
+    .filter(Boolean)
+  const names = ziyarats.length ? ziyarats : ['Makkah Ziyarat', 'Madina Ziyarat']
+  return [
+    'Yes, ziyarats are available.',
+    `Options: ${names.join(', ')}.`,
+    'Reply "Ziyarat required" to include them, or "Ziyarat not required" to keep them out of the package.',
+  ].join('\n')
+}
+
+function umrahHotelCategoriesText(): string {
+  return [
+    'Available hotel categories are:',
+    '',
+    '- Economy',
+    '- Standard',
+    '- Executive',
+    '',
+    'Reply for example: Change category to Standard.',
+  ].join('\n')
+}
+
+function isUmrahPackageUpdate(text: string): boolean {
+  return /\b(budget|date|travel date|days?|nights?|duration|adults?|persons?|people|pax|passengers?|couple|kids?|children|child|infants?|rooms?|room|single|double|triple|quad|sharing|economy|standard|executive|ziyarat required|ziyarat not required|vehicle|transport|car|staria|gmc|hiace|coaster|lower|cheaper|lowest|book it|confirm|proceed|reserve|change|update|set|increase|reduce)\b/i.test(text)
+}
+
+function isInformationalQuestion(text: string): boolean {
+  return /\?/.test(text) || /^(what|which|tell me|can you|do you|is there|are there|how|why)\b/i.test(text.trim())
+}
+
 function buildCurrentUmrahQuote(
   details: ParsedUmrahDetails,
   plannerData: Record<string, unknown>,
@@ -809,6 +841,16 @@ async function buildAiUmrahReply(args: {
       ].join('\n')
     }
 
+    if (/\bziyarat/i.test(args.latestText) && /\b(available|option|options|include|tell|what|which|\?)/i.test(args.latestText)) {
+      await upsertAiUmrahLead({ ...args, details })
+      return availableUmrahZiyaratsText(plannerData)
+    }
+
+    if (/\b(category|categories|hotel type|hotel types)\b/i.test(args.latestText) && /\b(what|which|other|available|options|\?)/i.test(args.latestText)) {
+      await upsertAiUmrahLead({ ...args, details })
+      return umrahHotelCategoriesText()
+    }
+
     if (/\b(lower|cheaper|cheap|lowest|less rate|low rate|reduce price|reduce rate)\b/i.test(args.latestText) && /\b(hotel|package|rate|price)\b/i.test(args.latestText)) {
       const lowerDetails = { ...details, hotelCategory: 'Economy' }
       const lowerQuote = buildCurrentUmrahQuote(lowerDetails, plannerData, {
@@ -837,6 +879,11 @@ async function buildAiUmrahReply(args: {
     if (/\b(available hotels|which hotels|hotel options|show hotels|list hotels)\b/i.test(args.latestText)) {
       await upsertAiUmrahLead({ ...args, details })
       return availableUmrahHotelsText(plannerData, details.hotelCategory ?? 'Economy')
+    }
+
+    if (isInformationalQuestion(args.latestText) && !isUmrahPackageUpdate(args.latestText)) {
+      await upsertAiUmrahLead({ ...args, details })
+      return null
     }
 
     const budget = budgetAmount(details.budget)
