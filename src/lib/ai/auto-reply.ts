@@ -219,7 +219,7 @@ function hasDateLikeText(text: string): boolean {
 }
 
 function parseBoolPreference(value: string): boolean | null {
-  if (/\b(not required|no|none|without|skip)\b/i.test(value)) return false
+  if (/\b(not required|not|no|none|without|skip)\b/i.test(value)) return false
   if (/\b(required|yes|include|needed|need)\b/i.test(value)) return true
   return null
 }
@@ -296,6 +296,7 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     ?? text.match(/\b([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)\s*(?:budget|range)\b/i)?.[1]
     ?? text.match(/\b(?:pkr|rs\.?|₨)\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
     ?? (/^\d[\d,.\s]*(?:k|lac|lakh|million|m)?$/i.test(ordered?.budget ?? '') ? ordered?.budget : null)
+    ?? (/^\d[\d,.\s]*(?:k|lac|lakh|million|m)?$/i.test(lines[0] ?? '') ? lines[0] : null)
     ?? null
   const parsedDays =
     latestDaysOverride(latest) ??
@@ -309,9 +310,10 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
   const parsedRooms = parseIntText(text.match(/\b(\d{1,3})\s*(?:\w+\s+){0,3}(?:rooms?|room)\b/i)?.[1])
     ?? roomCountFromText(ordered?.rooms)
   const parsedHotelCategory = validHotelCategory(text) ?? validHotelCategory(ordered?.hotelCategory)
-  const parsedZiyarat = parseBoolPreference(
-    text.match(/\b(?:ziyarat|ziyarats)\s*[:\-]?\s*([a-z\s/]+)\b/i)?.[1] ?? ordered?.ziyarat ?? latest,
-  )
+  const parsedZiyarat =
+    parseBoolPreference(latest) ??
+    parseBoolPreference(text.match(/\b(?:ziyarat|ziyarats)\s*[:\-]?\s*([a-z\s/]+)\b/i)?.[1] ?? '') ??
+    parseBoolPreference(ordered?.ziyarat ?? '')
   const parsedElderly = text.match(/\b(?:elderly|senior)[^,\n.]*/i)?.[0] ?? null
   const parsedRoomSharing = text.match(/\b(?:sharing|double|triple|quad|single)[^,\n.]*/i)?.[0] ?? ordered?.rooms ?? null
   const parsedSpecialRequirements =
@@ -387,18 +389,16 @@ function missingUmrahFields(details: ParsedUmrahDetails): UmrahRequiredField[] {
 
 function formatMissingUmrahPrompt(missing: UmrahRequiredField[]): string {
   const labels: Record<UmrahRequiredField, string> = {
-    budget: '💰 Budget',
-    travelDate: '📅 Travel Dates',
-    days: '🗓️ No. of Days',
-    travelers: '👥 No. of Travelers (Adults / Kids / Infants / Elderly with ages)',
-    hotelCategory: '🏨 Hotel Category (Economy / Standard / Executive)',
-    rooms: '🛏️ No. of Hotel Rooms (Please mention room sharing)',
-    ziyarat: '🕌 Makkah & Madinah Ziyarat (Required / Not Required)',
+    budget: 'Budget, for example 400000',
+    travelDate: 'Travel date, for example 2026-09-15',
+    days: 'No. of days, for example 10',
+    travelers: 'Travelers, for example 2 adults',
+    hotelCategory: 'Hotel category: Economy / Standard / Executive',
+    rooms: 'Rooms, for example 1 double room',
+    ziyarat: 'Ziyarat: Required or Not Required',
   }
   return [
-    'Thank you. I have noted your details.',
-    '',
-    'Please share the missing details below so we can prepare your Umrah package:',
+    missing.length === 1 ? 'Just one detail missing:' : 'Please share these missing details:',
     '',
     ...missing.map((field) => labels[field]),
   ].join('\n')
@@ -406,21 +406,10 @@ function formatMissingUmrahPrompt(missing: UmrahRequiredField[]): string {
 
 function formatInvalidUmrahAnswerPrompt(missing: UmrahRequiredField[]): string {
   return [
-    'I could not use that answer for the Umrah package details.',
-    '',
-    'Please send the required details in a clear format. For example:',
-    'Budget: 400000',
-    'Travel Dates: yyyy-mm-dd',
-    'No. of Days: 10',
-    'Travelers: 2 adults, 0 kids, 0 infants',
-    'Hotel Category: Economy / Standard / Executive',
-    'Rooms: 1 double room',
-    'Ziyarat: Required / Not Required',
-    '',
+    'I could not match that to the required Umrah detail.',
     missing.length ? formatMissingUmrahPrompt(missing) : 'If you want to change something, please mention the exact field and new value.',
   ].join('\n')
 }
-
 function invalidLatestUmrahDateMessage(latestText: string): string | null {
   if (!hasDateLikeText(latestText)) return null
   const parsed = parseDateText(latestText)
@@ -1052,5 +1041,6 @@ export async function dispatchInboundToAiReply(
     console.error('[ai auto-reply] dispatch failed:', err)
   }
 }
+
 
 
