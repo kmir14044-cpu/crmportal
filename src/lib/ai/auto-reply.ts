@@ -549,6 +549,7 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     rooms,
     roomSharing,
     vehicle: null,
+    includeTransport: null,
     ziyarat,
     selectedZiyarats: null,
     makkahHotelQuery: null,
