@@ -224,12 +224,21 @@ function parseBoolPreference(value: string): boolean | null {
   return null
 }
 
+function latestUmrahIntakeIndex(messages: { role: string; content: string }[]): number {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    if (message.role === 'assistant' && message.content.includes('customized Umrah package')) return i
+  }
+  return -1
+}
+
+function umrahDetailMessages(messages: { role: string; content: string }[]): { role: string; content: string }[] {
+  const intakeIndex = latestUmrahIntakeIndex(messages)
+  return intakeIndex >= 0 ? messages.slice(intakeIndex + 1) : messages
+}
+
 function userDetailLines(messages: { role: string; content: string }[]): string[] {
-  const intakeIndex = messages.findIndex((message) =>
-    message.role === 'assistant' && message.content.includes('customized Umrah package'),
-  )
-  return messages
-    .slice(Math.max(0, intakeIndex + 1))
+  return umrahDetailMessages(messages)
     .filter((message) => message.role === 'user' && !/^\s*umrah\s*$/i.test(message.content))
     .flatMap((message) => message.content.split(/\r?\n/))
     .map((line) => line.trim())
@@ -239,6 +248,14 @@ function userDetailLines(messages: { role: string; content: string }[]): string[
 
 function firstNumber(value: string | undefined): number | null {
   return parseIntText(value?.match(/\b(\d{1,4})\b/)?.[1])
+}
+
+function latestDaysOverride(text: string): number | null {
+  if (!/\b(reduce|change|set|update|duration|days?|nights?)\b/i.test(text)) return null
+  return parseIntText(
+    text.match(/\b(?:reduce|change|set|update|duration|days?|nights?)[^\d]{0,40}(\d{1,3})\b/i)?.[1] ??
+    text.match(/\b(\d{1,3})\s*(?:days?|nights?)\b/i)?.[1],
+  )
 }
 
 function validHotelCategory(value: string | undefined | null): string | null {
@@ -261,8 +278,9 @@ function likelyUsefulUmrahAnswer(text: string): boolean {
 }
 
 function parseUmrahDetails(messages: { role: string; content: string }[]): ParsedUmrahDetails {
-  const text = conversationText(messages)
-  const latest = [...messages].reverse().find((message) => message.role === 'user')?.content ?? ''
+  const detailMessages = umrahDetailMessages(messages)
+  const text = conversationText(detailMessages)
+  const latest = [...detailMessages].reverse().find((message) => message.role === 'user')?.content ?? ''
   const lines = userDetailLines(messages)
   const ordered = lines.length >= 5 ? {
     budget: lines[0],
@@ -279,8 +297,12 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     ?? text.match(/\b(?:pkr|rs\.?|₨)\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
     ?? (/^\d[\d,.\s]*(?:k|lac|lakh|million|m)?$/i.test(ordered?.budget ?? '') ? ordered?.budget : null)
     ?? null
-  const parsedDays = parseIntText(text.match(/\b(\d{1,3})\s*(?:days?|nights?)\b/i)?.[1]) ?? firstNumber(ordered?.days)
+  const parsedDays =
+    latestDaysOverride(latest) ??
+    parseIntText(text.match(/\b(\d{1,3})\s*(?:days?|nights?)\b/i)?.[1]) ??
+    firstNumber(ordered?.days)
   const parsedAdults = parseIntText(text.match(/\b(\d{1,3})\s*(?:adults?|persons?|people|pax|passengers?)\b/i)?.[1])
+    ?? (/\bcouple\b/i.test(text) ? 2 : null)
     ?? firstNumber(ordered?.travelers)
   const parsedChildren = parseIntText(text.match(/\b(\d{1,3})\s*(?:kids?|children|child)\b/i)?.[1])
   const parsedInfants = parseIntText(text.match(/\b(\d{1,3})\s*(?:infants?|babies|baby)\b/i)?.[1])
@@ -302,7 +324,7 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
 
   return {
     budget: parsedBudget?.trim() ?? null,
-    travelDate: latestValidDate(messages, ordered?.travelDate ?? text),
+    travelDate: latestValidDate(detailMessages, ordered?.travelDate ?? text),
     days: parsedDays,
     makkahNights,
     madinahNights,
