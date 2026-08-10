@@ -1189,6 +1189,20 @@ async function buildAiUmrahReply(args: {
     }
 
     if (
+      /\b(?:1|one|single|per)\s*(?:person|adult|traveller|traveler|pax)\s*(?:price|rate|cost|charges?)?\b/i.test(args.latestText) ||
+      /\b(?:price|rate|cost|charges?)\s*(?:for|of|per)\s*(?:1|one|single|per)\s*(?:person|adult|traveller|traveler|pax)\b/i.test(args.latestText) ||
+      /\bper\s*(?:person|adult|traveller|traveler|pax)\b/i.test(args.latestText)
+    ) {
+      const perPerson = Math.ceil(quote.total / Math.max(1, quote.travelers))
+      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+      return [
+        `Approx per person price is PKR ${perPerson.toLocaleString('en-PK')}.`,
+        `Total package: ${quote.priceText} for ${quote.travelers} traveler${quote.travelers === 1 ? '' : 's'}.`,
+        'This is an estimate based on the selected hotels, transport, visa, and current live package data.',
+      ].join('\n')
+    }
+
+    if (
       /\b(rate|price|total|quote|quotation|package)\b.{0,80}\b(include|included|includes|for|cover|covers)\b.{0,80}\b(all|people|persons|adults|travellers|travelers|pax)\b/i.test(args.latestText) ||
       /\b(include|included|includes|cover|covers)\b.{0,80}\b(all|people|persons|adults|travellers|travelers|pax)\b/i.test(args.latestText)
     ) {
@@ -1474,16 +1488,27 @@ export async function dispatchInboundToAiReply(
       })
       const document = typeof umrahReply === 'string' ? null : umrahReply.document
       if (document?.link) {
-        await engineSendMedia({
-          accountId,
-          userId: configOwnerUserId,
-          conversationId,
-          contactId,
-          kind: 'document',
-          link: document.link,
-          filename: document.filename,
-          caption: document.caption,
-        })
+        try {
+          await engineSendMedia({
+            accountId,
+            userId: configOwnerUserId,
+            conversationId,
+            contactId,
+            kind: 'document',
+            link: document.link,
+            filename: document.filename,
+            caption: document.caption,
+          })
+        } catch (err) {
+          console.error('[ai auto-reply] quote PDF document send failed:', err)
+          await engineSendText({
+            accountId,
+            userId: configOwnerUserId,
+            conversationId,
+            contactId,
+            text: `Your Umrah quotation PDF is ready:\n${document.link}`,
+          })
+        }
       }
       return
     }
