@@ -42,6 +42,7 @@ export interface UmrahQuoteInput {
   room_type?: string
   hotel_category?: string
   budget?: string | number
+  hotel_preference?: 'cheapest'
   selected_hotels?: Record<string, string>
   vehicle?: string
   transport_mode?: 'full' | 'selective'
@@ -283,6 +284,7 @@ function selectHotel(
   nights: number,
   childAges: number[],
   seed: string,
+  hotelPreference?: 'cheapest',
   hotelId?: string,
 ): JsonRecord | null {
   const hotels = rows(data, 'hotels').filter((hotel) => norm(hotel.city) === norm(city))
@@ -296,6 +298,7 @@ function selectHotel(
   const available = preferred.filter((item) => item.stay.totalSar > 0 && !item.stay.hasMissingRates)
   const pool = (available.length ? available : preferred)
     .sort((a, b) => a.stay.totalSar - b.stay.totalSar)
+  if (pool.length && hotelPreference === 'cheapest') return pool[0].hotel
   if (pool.length) return pool[stableIndex(seed, pool.length)].hotel
   const fallback = hotels.filter((hotel) => (hotel.seasonRates as unknown[] | undefined)?.length)
   return fallback[stableIndex(seed, fallback.length)] ?? hotels[stableIndex(seed, hotels.length)] ?? null
@@ -370,6 +373,7 @@ export function quoteUmrah(input: UmrahQuoteInput, data: JsonRecord = defaultDat
         input.hotel_category,
         input.budget,
       ].join('|'),
+      input.hotel_preference,
       selectedHotels[hotelKey],
     )
     const stay = hotelStayCost(data, hotel, roomType, stop.checkIn, stop.nights, childAges)

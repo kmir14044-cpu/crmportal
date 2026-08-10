@@ -7,6 +7,7 @@ import { buildSystemPrompt } from './defaults'
 import { latestUserMessage } from './query'
 import { engineSendText } from '@/lib/flows/meta-send'
 import { loadUmrahPlannerDataForAccount, quoteUmrah } from '@/lib/umrah-planner/quote'
+import type { UmrahQuoteResult } from '@/lib/umrah-planner/quote'
 
 type AdminClient = ReturnType<typeof supabaseAdmin>
 
@@ -504,6 +505,41 @@ function availableUmrahHotelsText(data: Record<string, unknown>, categoryValue: 
   ].join('\n')
 }
 
+function buildCurrentUmrahQuote(
+  details: ParsedUmrahDetails,
+  plannerData: Record<string, unknown>,
+  options: { hotelCategory?: string; hotelPreference?: 'cheapest' } = {},
+): { quote: UmrahQuoteResult; vehicle: string } {
+  const stopNights = details.madinahNights && details.days
+    ? [Math.max(0, details.days - details.madinahNights), details.madinahNights]
+    : details.makkahNights && details.days
+      ? [details.makkahNights, Math.max(0, details.days - details.makkahNights)]
+      : undefined
+  const vehicle = details.specialRequirements?.match(/\b(shared shuttle|car|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car'
+  return {
+    vehicle,
+    quote: quoteUmrah({
+      name: 'WhatsApp lead',
+      phone: '',
+      start_date: details.travelDate!,
+      route_preset_id: 'mk-md',
+      nights: details.days!,
+      stop_nights: stopNights,
+      adults: details.adults ?? 1,
+      children: details.children ?? 0,
+      infants: details.infants ?? 0,
+      rooms: details.rooms ?? 1,
+      room_type: details.roomSharing?.match(/\b(single|double|triple|quad)\b/i)?.[1] ?? 'Double',
+      hotel_category: normalizedUmrahHotelCategory(options.hotelCategory ?? details.hotelCategory),
+      budget: details.budget ?? undefined,
+      hotel_preference: options.hotelPreference,
+      vehicle,
+      include_visa: true,
+      include_ziyarat: details.ziyarat ?? false,
+    }, plannerData),
+  }
+}
+
 function umrahLeadNotes(details: ParsedUmrahDetails, latestText: string): string {
   return [
     'AI Umrah request from WhatsApp.',
@@ -753,7 +789,41 @@ async function buildAiUmrahReply(args: {
 
   try {
     const plannerData = await loadUmrahPlannerDataForAccount(args.db, args.accountId)
-    const currentVehicle = details.specialRequirements?.match(/\b(shared shuttle|car|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car'
+    const { quote, vehicle: currentVehicle } = buildCurrentUmrahQuote(details, plannerData)
+
+    if (/\b(book it|confirm|proceed|go ahead|reserve|final|great book)\b/i.test(args.latestText)) {
+      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+      return [
+        'Great, I have marked this Umrah package for booking follow-up.',
+        `Current package total: ${quote.priceText}`,
+        'Our team will confirm hotel availability, payment details, and required documents before final booking.',
+      ].join('\n')
+    }
+
+    if (/\bvisa\b/i.test(args.latestText) && /\b(fee|fees|price|cost|charges|tell|about)\b/i.test(args.latestText)) {
+      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+      return [
+        `Visa fee included in this quotation: PKR ${Math.round(quote.visaTotal).toLocaleString('en-PK')}.`,
+        `This is calculated for ${quote.visaTravelers} traveler${quote.visaTravelers === 1 ? '' : 's'}.`,
+        'Final visa charges can vary if supplier or government fees change before booking.',
+      ].join('\n')
+    }
+
+    if (/\b(lower|cheaper|cheap|lowest|less rate|low rate|reduce price|reduce rate)\b/i.test(args.latestText) && /\b(hotel|package|rate|price)\b/i.test(args.latestText)) {
+      const lowerDetails = { ...details, hotelCategory: 'Economy' }
+      const lowerQuote = buildCurrentUmrahQuote(lowerDetails, plannerData, {
+        hotelCategory: 'Economy',
+        hotelPreference: 'cheapest',
+      }).quote
+      const reply = [
+        'I checked the lower-rate available hotel option for these dates.',
+        '',
+        lowerQuote.whatsappText,
+      ].join('\n')
+      await upsertAiUmrahLead({ ...args, details: lowerDetails, quoteText: reply })
+      return reply
+    }
+
     if (/\b(which|what).{0,40}\b(vehicle|transport|car)\b|\b(vehicle|transport).{0,40}\bwith us\b/i.test(args.latestText)) {
       const options = availableUmrahVehicles(plannerData)
       await upsertAiUmrahLead({ ...args, details })
@@ -769,29 +839,6 @@ async function buildAiUmrahReply(args: {
       return availableUmrahHotelsText(plannerData, details.hotelCategory ?? 'Economy')
     }
 
-    const stopNights = details.madinahNights && details.days
-      ? [Math.max(0, details.days - details.madinahNights), details.madinahNights]
-      : details.makkahNights && details.days
-        ? [details.makkahNights, Math.max(0, details.days - details.makkahNights)]
-        : undefined
-    const quote = quoteUmrah({
-      name: 'WhatsApp lead',
-      phone: '',
-      start_date: details.travelDate!,
-      route_preset_id: 'mk-md',
-      nights: details.days!,
-      stop_nights: stopNights,
-      adults: details.adults ?? 1,
-      children: details.children ?? 0,
-      infants: details.infants ?? 0,
-      rooms: details.rooms ?? 1,
-      room_type: details.roomSharing?.match(/\b(single|double|triple|quad)\b/i)?.[1] ?? 'Double',
-      hotel_category: normalizedUmrahHotelCategory(details.hotelCategory),
-      budget: details.budget ?? undefined,
-      vehicle: currentVehicle,
-      include_visa: true,
-      include_ziyarat: details.ziyarat ?? false,
-    }, plannerData)
     const budget = budgetAmount(details.budget)
     const quoteText = budget !== null && budget < quote.total
       ? [
