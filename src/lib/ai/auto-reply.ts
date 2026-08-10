@@ -639,8 +639,8 @@ function mergeUmrahDetails(base: ParsedUmrahDetails, ai: Partial<ParsedUmrahDeta
     roomSharing: ai.roomSharing ?? base.roomSharing,
     // Transport changes are parsed deterministically from the latest user messages.
     // Prefer them over the AI extraction so old transport preferences cannot override a new 'no transport' / 'Hiace' command.
-    vehicle: base.vehicle ?? ai.vehicle,
-    includeTransport: base.includeTransport ?? ai.includeTransport,
+    vehicle: base.vehicle ?? ai.vehicle ?? null,
+    includeTransport: base.includeTransport ?? ai.includeTransport ?? null,
     ziyarat: ai.ziyarat ?? base.ziyarat,
     selectedZiyarats: ai.selectedZiyarats ?? base.selectedZiyarats,
     makkahHotelQuery: ai.makkahHotelQuery ?? base.makkahHotelQuery,
