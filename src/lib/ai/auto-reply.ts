@@ -253,14 +253,35 @@ function firstNumber(value: string | undefined): number | null {
 function latestDaysOverride(text: string): number | null {
   if (!/\b(reduce|change|set|update|duration|days?|nights?)\b/i.test(text)) return null
   return parseIntText(
+    text.match(/\b(?:increase|extend|make)[^\d]{0,40}(\d{1,3})\b/i)?.[1] ??
     text.match(/\b(?:reduce|change|set|update|duration|days?|nights?)[^\d]{0,40}(\d{1,3})\b/i)?.[1] ??
     text.match(/\b(\d{1,3})\s*(?:days?|nights?)\b/i)?.[1],
   )
 }
 
+function latestDaysFromMessages(messages: { role: string; content: string }[]): number | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    if (message.role !== 'user') continue
+    const value = latestDaysOverride(message.content)
+    if (value !== null) return value
+  }
+  return null
+}
+
 function validHotelCategory(value: string | undefined | null): string | null {
   const match = value?.match(/\b(economy plus|economy|4\s*⭐|4\s*star|four\s*star|5\s*⭐|5\s*star|five\s*star|standard|executive)\b/i)?.[1]
   return match ? titleCase(match) : null
+}
+
+function latestHotelCategoryFromMessages(messages: { role: string; content: string }[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    if (message.role !== 'user') continue
+    const value = validHotelCategory(message.content)
+    if (value) return value
+  }
+  return null
 }
 
 function roomCountFromText(value: string | undefined | null): number | null {
@@ -299,7 +320,7 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     ?? (/^\d[\d,.\s]*(?:k|lac|lakh|million|m)?$/i.test(lines[0] ?? '') ? lines[0] : null)
     ?? null
   const parsedDays =
-    latestDaysOverride(latest) ??
+    latestDaysFromMessages(detailMessages) ??
     parseIntText(text.match(/\b(\d{1,3})\s*(?:days?|nights?)\b/i)?.[1]) ??
     firstNumber(ordered?.days)
   const parsedAdults = parseIntText(text.match(/\b(\d{1,3})\s*(?:adults?|persons?|people|pax|passengers?)\b/i)?.[1])
@@ -309,7 +330,7 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
   const parsedInfants = parseIntText(text.match(/\b(\d{1,3})\s*(?:infants?|babies|baby)\b/i)?.[1])
   const parsedRooms = parseIntText(text.match(/\b(\d{1,3})\s*(?:\w+\s+){0,3}(?:rooms?|room)\b/i)?.[1])
     ?? roomCountFromText(ordered?.rooms)
-  const parsedHotelCategory = validHotelCategory(text) ?? validHotelCategory(ordered?.hotelCategory)
+  const parsedHotelCategory = latestHotelCategoryFromMessages(detailMessages) ?? validHotelCategory(ordered?.hotelCategory)
   const parsedZiyarat =
     parseBoolPreference(latest) ??
     parseBoolPreference(text.match(/\b(?:ziyarat|ziyarats)\s*[:\-]?\s*([a-z\s/]+)\b/i)?.[1] ?? '') ??
@@ -435,6 +456,52 @@ function budgetAmount(value: string | null): number | null {
   if (/\b(m|million)\b/.test(normalized)) return Math.round(amount * 1000000)
   if (/\bk\b/.test(normalized)) return Math.round(amount * 1000)
   return Math.round(amount)
+}
+
+function plannerRows(data: Record<string, unknown>, key: string): Record<string, unknown>[] {
+  const value = data[key]
+  return Array.isArray(value)
+    ? value.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object' && !Array.isArray(item)))
+    : []
+}
+
+function availableUmrahVehicles(data: Record<string, unknown>): string[] {
+  const vehicles = new Set<string>()
+  for (const row of plannerRows(data, 'transportRates')) {
+    const rates = row.rates
+    if (!rates || typeof rates !== 'object' || Array.isArray(rates)) continue
+    for (const key of Object.keys(rates)) {
+      if (key.trim()) vehicles.add(key.trim())
+    }
+  }
+  return Array.from(vehicles).slice(0, 8)
+}
+
+function availableUmrahHotelsText(data: Record<string, unknown>, categoryValue: string): string {
+  const categoryName = normalizedUmrahHotelCategory(categoryValue)
+  const hotels = plannerRows(data, 'hotels')
+    .filter((hotel) => normalizedUmrahHotelCategory(String(hotel.category ?? '')) === categoryName)
+  const byCity = (city: string) => hotels
+    .filter((hotel) => String(hotel.city ?? '').toLowerCase().includes(city.toLowerCase()))
+    .slice(0, 6)
+    .map((hotel) => {
+      const name = String(hotel.name ?? 'Hotel')
+      const distance = String(hotel.distance ?? '').trim()
+      return distance ? `- ${name} (${distance})` : `- ${name}`
+    })
+  const makkah = byCity('makkah')
+  const madinah = byCity('mad')
+  return [
+    `Available ${categoryName} hotels from current portal data:`,
+    '',
+    'Makkah:',
+    ...(makkah.length ? makkah : ['- No matching Makkah hotel found']),
+    '',
+    'Madina:',
+    ...(madinah.length ? madinah : ['- No matching Madina hotel found']),
+    '',
+    'Reply with the hotel name if you want to use one of these.',
+  ].join('\n')
 }
 
 function umrahLeadNotes(details: ParsedUmrahDetails, latestText: string): string {
@@ -685,6 +752,23 @@ async function buildAiUmrahReply(args: {
   }
 
   try {
+    const plannerData = await loadUmrahPlannerDataForAccount(args.db, args.accountId)
+    const currentVehicle = details.specialRequirements?.match(/\b(shared shuttle|car|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car'
+    if (/\b(which|what).{0,40}\b(vehicle|transport|car)\b|\b(vehicle|transport).{0,40}\bwith us\b/i.test(args.latestText)) {
+      const options = availableUmrahVehicles(plannerData)
+      await upsertAiUmrahLead({ ...args, details })
+      return [
+        `Your current package is calculated with ${currentVehicle}.`,
+        options.length ? `Available vehicle options: ${options.join(', ')}.` : null,
+        'If you want to change it, reply for example: Change vehicle to Hiace.',
+      ].filter(Boolean).join('\n')
+    }
+
+    if (/\b(available hotels|which hotels|hotel options|show hotels|list hotels)\b/i.test(args.latestText)) {
+      await upsertAiUmrahLead({ ...args, details })
+      return availableUmrahHotelsText(plannerData, details.hotelCategory ?? 'Economy')
+    }
+
     const stopNights = details.madinahNights && details.days
       ? [Math.max(0, details.days - details.madinahNights), details.madinahNights]
       : details.makkahNights && details.days
@@ -704,10 +788,10 @@ async function buildAiUmrahReply(args: {
       room_type: details.roomSharing?.match(/\b(single|double|triple|quad)\b/i)?.[1] ?? 'Double',
       hotel_category: normalizedUmrahHotelCategory(details.hotelCategory),
       budget: details.budget ?? undefined,
-      vehicle: details.specialRequirements?.match(/\b(shared shuttle|car|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car',
+      vehicle: currentVehicle,
       include_visa: true,
       include_ziyarat: details.ziyarat ?? false,
-    }, await loadUmrahPlannerDataForAccount(args.db, args.accountId))
+    }, plannerData)
     const budget = budgetAmount(details.budget)
     const quoteText = budget !== null && budget < quote.total
       ? [
