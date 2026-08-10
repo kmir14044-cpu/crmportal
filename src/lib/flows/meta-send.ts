@@ -15,6 +15,7 @@ import {
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
 import { supabaseAdmin } from './admin-client'
+import { uploadMediaFromUrlToMeta, sendMediaById } from './meta-media-upload'
 
 // ------------------------------------------------------------
 // Flows-side Meta sender (interactive variants).
@@ -197,7 +198,43 @@ export async function engineSendMedia(
 
   const accessToken = decrypt(config.access_token)
 
+  // Documents (including generated Umrah PDFs) are more reliable when we
+  // upload the bytes to Meta first and send by media id. This avoids asking
+  // Meta to fetch a Supabase/public URL at message-send time.
+  //
+  // Keep the original URL in messages.media_url below so the CRM inbox can
+  // still open/render the stored file. Images/video/audio keep the existing
+  // URL-based path unchanged.
+  let uploadedMediaId: string | null = null
+  if (args.kind === 'document') {
+    try {
+      const uploaded = await uploadMediaFromUrlToMeta({
+        phoneNumberId: config.phone_number_id,
+        accessToken,
+        sourceUrl: args.link,
+        filename: args.filename || 'document.pdf',
+        mimeType: 'application/pdf',
+      })
+      uploadedMediaId = uploaded.mediaId
+    } catch (err) {
+      console.error('[flows meta-send] document upload-to-Meta failed; falling back to link send:', err)
+    }
+  }
+
   const attempt = async (phone: string): Promise<string> => {
+    if (args.kind === 'document' && uploadedMediaId) {
+      const r = await sendMediaById({
+        phoneNumberId: config.phone_number_id,
+        accessToken,
+        to: phone,
+        kind: 'document',
+        mediaId: uploadedMediaId,
+        caption: args.caption,
+        filename: args.filename,
+      })
+      return r.messageId
+    }
+
     const r = await sendMediaMessage({
       phoneNumberId: config.phone_number_id,
       accessToken,
