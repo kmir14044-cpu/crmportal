@@ -291,10 +291,20 @@ function latestBudgetFromMessages(messages: { role: string; content: string }[])
       message.content.match(/\b(?:pkr|rs\.?|₨)\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
     if (explicit) return explicit.trim()
     const lines = message.content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    const firstMoneyLike = lines
+      .map((line) => {
+        if (/^\s*20\d{2}[-/]/.test(line)) return null
+        const match = line.match(/^\s*([0-9][0-9,.]*(?:\s*(?:k|lac|lakh|million|m))?)(?=\s|$)/i)?.[1]
+        if (!match) return null
+        const amount = budgetAmount(match)
+        return amount !== null && amount >= 10000 ? match.trim() : null
+      })
+      .find(Boolean)
+    if (firstMoneyLike) return firstMoneyLike
     const bare = lines.find((line) => {
       if (!/^\d[\d,.\s]*(?:k|lac|lakh|million|m)?$/i.test(line)) return false
       const amount = budgetAmount(line)
-      return amount !== null && amount >= 1000
+      return amount !== null && amount >= 10000
     })
     if (bare) return bare
   }
