@@ -102,6 +102,11 @@ interface AiReplyDocument {
 
 type AiReplyPayload = string | { text: string; document?: AiReplyDocument }
 
+interface UmrahAiDecision {
+  action: 'send_quote' | 'answer_question' | 'booking_follow_up' | 'handoff'
+  answer: string | null
+}
+
 function travelLeadTopic(text: string): string | null {
   const normalized = text.trim().toLowerCase()
   if (!normalized) return null
@@ -858,6 +863,98 @@ function buildCurrentUmrahQuote(
   }
 }
 
+function umrahQuoteContext(quote: UmrahQuoteResult): Record<string, unknown> {
+  return {
+    total: quote.priceText,
+    totalNumber: quote.total,
+    perPerson: Math.ceil(quote.total / Math.max(1, quote.travelers)),
+    currency: quote.currency,
+    route: quote.route,
+    travelDate: quote.startDate,
+    nights: quote.nights,
+    travelers: quote.travelers,
+    visaTravelers: quote.visaTravelers,
+    rooms: quote.rooms,
+    roomType: quote.roomType,
+    hotelCategory: quote.packageCategory,
+    vehicle: quote.vehicle,
+    hotels: quote.hotelLines.map((line) => ({
+      city: line.city,
+      hotel: line.hotel,
+      nights: line.nights,
+      checkIn: line.checkIn,
+      checkOut: line.checkOut,
+      category: line.category,
+      distance: line.distance,
+      meal: line.meal,
+    })),
+    transportSectors: quote.transportSectors.map((sector) => sector.label),
+    visaIncluded: quote.visaTotal > 0,
+    ziyarats: quote.ziyarats.map((item) => item.name),
+    hasMissingRates: quote.hasMissingRates,
+    formula: 'hotel room-night total + transport sectors + visa per traveler + selected ziyarats + category profit = final PKR total',
+  }
+}
+
+async function decideAiUmrahAction(args: {
+  db: AdminClient
+  accountId: string
+  config: AiConfig
+  latestText: string
+  messages: { role: string; content: string }[]
+  details: ParsedUmrahDetails
+  quote: UmrahQuoteResult
+}): Promise<UmrahAiDecision | null> {
+  try {
+    const knowledge = await retrieveKnowledge(args.db, args.accountId, args.config, args.latestText)
+    const systemPrompt = [
+      'You are the routing brain for a Tours in Pakistan WhatsApp Umrah sales assistant.',
+      'Decide what the assistant should do with the latest customer message.',
+      'Return JSON only. No markdown. No explanations.',
+      '',
+      'Actions:',
+      '- send_quote: customer gave package details, changed package details, asked for cheaper/lower option, changed hotel/category/days/travelers/budget/ziyarat/vehicle, or wants a new quotation.',
+      '- answer_question: customer asks about the current quote, total, per-person price, what is included, visa, hotels, transport, ziyarats, availability options, or any normal follow-up that can be answered from the quote/context.',
+      '- booking_follow_up: customer clearly wants to book/confirm/proceed.',
+      '- handoff: customer is upset, asks for human, or asks for facts unavailable in quote/knowledge.',
+      '',
+      'When action is answer_question, write a short WhatsApp-ready answer using only the quote context and knowledge. Do not repeat the full quotation. Do not invent availability or prices.',
+      'When action is send_quote, answer must be null because code will generate the quote from backend data.',
+      'When action is booking_follow_up, answer should confirm team follow-up without promising final availability.',
+      'When action is handoff, answer must be null.',
+      '',
+      `Current quote context:\n${JSON.stringify(umrahQuoteContext(args.quote))}`,
+      `Extracted customer details:\n${JSON.stringify(args.details)}`,
+      knowledge.length ? `Knowledge base:\n${knowledge.join('\n---\n')}` : 'Knowledge base: none',
+      '',
+      'JSON shape: {"action":"send_quote|answer_question|booking_follow_up|handoff","answer":string|null}',
+    ].join('\n')
+
+    const recentMessages = args.messages
+      .slice(-12)
+      .filter((message) => message.role === 'user' || message.role === 'assistant')
+      .map((message) => ({
+        role: message.role as 'user' | 'assistant',
+        content: message.content,
+      }))
+    const result = await generateReply({
+      config: args.config,
+      systemPrompt,
+      messages: recentMessages,
+    })
+    const json = extractJsonObject(result.text)
+    const action = String(json?.action ?? '')
+    if (!['send_quote', 'answer_question', 'booking_follow_up', 'handoff'].includes(action)) return null
+    return {
+      action: action as UmrahAiDecision['action'],
+      answer: stringValue(json?.answer),
+    }
+  } catch (err) {
+    console.error('[ai auto-reply] umrah action decision failed:', err)
+    return null
+  }
+}
+
 async function uploadUmrahQuotePdf(args: {
   db: AdminClient
   accountId: string
@@ -1151,6 +1248,34 @@ async function buildAiUmrahReply(args: {
   try {
     const plannerData = await loadUmrahPlannerDataForAccount(args.db, args.accountId)
     const { quote, vehicle: currentVehicle } = buildCurrentUmrahQuote(details, plannerData)
+    const aiDecision = await decideAiUmrahAction({
+      db: args.db,
+      accountId: args.accountId,
+      config: args.config,
+      latestText: args.latestText,
+      messages: args.messages,
+      details,
+      quote,
+    })
+
+    if (aiDecision?.action === 'handoff') {
+      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+      return null
+    }
+
+    if (aiDecision?.action === 'booking_follow_up') {
+      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+      return aiDecision.answer || [
+        'Great, I have marked this Umrah package for booking follow-up.',
+        `Current package total: ${quote.priceText}.`,
+        'Our team will confirm hotel availability, payment details, and required documents before final booking.',
+      ].join('\n')
+    }
+
+    if (aiDecision?.action === 'answer_question' && aiDecision.answer) {
+      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+      return aiDecision.answer
+    }
 
     if (/\b(book it|confirm|proceed|go ahead|reserve|final|great book)\b/i.test(args.latestText)) {
       await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
