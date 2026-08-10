@@ -8,6 +8,7 @@ import { latestUserMessage } from './query'
 import { engineSendText } from '@/lib/flows/meta-send'
 import { loadUmrahPlannerDataForAccount, quoteUmrah } from '@/lib/umrah-planner/quote'
 import type { UmrahQuoteResult } from '@/lib/umrah-planner/quote'
+import type { AiConfig } from './types'
 
 type AdminClient = ReturnType<typeof supabaseAdmin>
 
@@ -77,7 +78,11 @@ interface ParsedUmrahDetails {
   hotelCategory: string | null
   rooms: number | null
   roomSharing: string | null
+  vehicle: string | null
   ziyarat: boolean | null
+  selectedZiyarats: string[] | null
+  makkahHotelQuery: string | null
+  madinahHotelQuery: string | null
   specialRequirements: string | null
 }
 
@@ -285,6 +290,54 @@ function latestHotelCategoryFromMessages(messages: { role: string; content: stri
   return null
 }
 
+function validUmrahVehicle(value: string | undefined | null): string | null {
+  const match = value?.match(/\b(shared shuttle|staria|gmc|hiace|coaster|car)\b/i)?.[1]
+  return match ? titleCase(match) : null
+}
+
+function latestVehicleFromMessages(messages: { role: string; content: string }[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    if (message.role !== 'user') continue
+    if (!/\b(add|change|set|vehicle|transport|car|staria|gmc|hiace|coaster|shared shuttle)\b/i.test(message.content)) continue
+    const value = validUmrahVehicle(message.content)
+    if (value) return value
+  }
+  return null
+}
+
+function selectedZiyaratIdsFromMessages(messages: { role: string; content: string }[]): string[] | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    if (message.role !== 'user') continue
+    if (!/\b(ziyarat|badar|taif|makkah|madina|madinah)\b/i.test(message.content)) continue
+    if (parseBoolPreference(message.content) === false) return []
+    const ids = new Set<string>()
+    if (/\bbadar\b/i.test(message.content)) ids.add('badar')
+    if (/\btaif\b/i.test(message.content)) ids.add('taif')
+    if (/\bmakkah\b/i.test(message.content)) ids.add('makkah')
+    if (/\bmadina|madinah\b/i.test(message.content)) ids.add('madina')
+    if (parseBoolPreference(message.content) === true && ids.size === 0) {
+      ids.add('makkah')
+      ids.add('madina')
+    }
+    if (ids.size > 0) return Array.from(ids)
+  }
+  return null
+}
+
+function latestHotelQueryFromMessages(messages: { role: string; content: string }[], city: 'makkah' | 'madinah'): string | null {
+  const cityPattern = city === 'makkah' ? 'makkah' : 'madina|madinah'
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    if (message.role !== 'user') continue
+    const direct = message.content.match(new RegExp(`\\b(?:${cityPattern})\\b.{0,40}\\b(?:hotel)?\\s*(?:to|as|with)?\\s*([a-z0-9][a-z0-9\\s-]{2,40})`, 'i'))?.[1]
+    if (direct) return direct.trim()
+    if (/\bvoco\b/i.test(message.content) && city === 'makkah') return 'voco'
+  }
+  return null
+}
+
 function roomCountFromText(value: string | undefined | null): number | null {
   if (!value) return null
   if (!/\b(rooms?|room|single|double|triple|quad|sharing)\b/i.test(value)) return null
@@ -301,8 +354,9 @@ function likelyUsefulUmrahAnswer(text: string): boolean {
 
 function parseUmrahDetails(messages: { role: string; content: string }[]): ParsedUmrahDetails {
   const detailMessages = umrahDetailMessages(messages)
-  const text = conversationText(detailMessages)
-  const latest = [...detailMessages].reverse().find((message) => message.role === 'user')?.content ?? ''
+  const userMessages = detailMessages.filter((message) => message.role === 'user')
+  const text = conversationText(userMessages)
+  const latest = [...userMessages].reverse().find((message) => message.role === 'user')?.content ?? ''
   const lines = userDetailLines(messages)
   const ordered = lines.length >= 5 ? {
     budget: lines[0],
@@ -336,6 +390,7 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     parseBoolPreference(latest) ??
     parseBoolPreference(text.match(/\b(?:ziyarat|ziyarats)\s*[:\-]?\s*([a-z\s/]+)\b/i)?.[1] ?? '') ??
     parseBoolPreference(ordered?.ziyarat ?? '')
+  const selectedZiyarats = selectedZiyaratIdsFromMessages(userMessages)
   const parsedElderly = text.match(/\b(?:elderly|senior)[^,\n.]*/i)?.[0] ?? null
   const parsedRoomSharing = text.match(/\b(?:sharing|double|triple|quad|single)[^,\n.]*/i)?.[0] ?? ordered?.rooms ?? null
   const parsedSpecialRequirements =
@@ -359,7 +414,11 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     hotelCategory: parsedHotelCategory,
     rooms: parsedRooms,
     roomSharing: parsedRoomSharing,
-    ziyarat: parsedZiyarat,
+    vehicle: latestVehicleFromMessages(userMessages),
+    ziyarat: selectedZiyarats ? selectedZiyarats.length > 0 : parsedZiyarat,
+    selectedZiyarats,
+    makkahHotelQuery: latestHotelQueryFromMessages(userMessages, 'makkah'),
+    madinahHotelQuery: latestHotelQueryFromMessages(userMessages, 'madinah'),
     specialRequirements: parsedSpecialRequirements?.trim() ?? null,
   }
 
@@ -396,8 +455,130 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     hotelCategory: hotelCategory ? titleCase(hotelCategory ?? undefined) : null,
     rooms,
     roomSharing,
+    vehicle: null,
     ziyarat,
+    selectedZiyarats: null,
+    makkahHotelQuery: null,
+    madinahHotelQuery: null,
     specialRequirements: specialRequirements?.trim() ?? null,
+  }
+}
+
+function extractJsonObject(text: string): Record<string, unknown> | null {
+  const cleaned = text.trim().replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim()
+  const start = cleaned.indexOf('{')
+  const end = cleaned.lastIndexOf('}')
+  if (start < 0 || end <= start) return null
+  try {
+    const parsed = JSON.parse(cleaned.slice(start, end + 1))
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function numberValueFromAi(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value)
+  if (typeof value === 'string') return parseIntText(value.match(/\d{1,4}/)?.[0])
+  return null
+}
+
+function booleanValueFromAi(value: unknown): boolean | null {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') return parseBoolPreference(value)
+  return null
+}
+
+function stringArrayFromAi(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null
+  const items = value.map((item) => stringValue(item)).filter(Boolean) as string[]
+  return items.length ? items : null
+}
+
+function normalizeAiUmrahDetails(raw: Record<string, unknown>): Partial<ParsedUmrahDetails> {
+  const travelDate = parseDateText(stringValue(raw.travelDate) ?? stringValue(raw.travel_date) ?? '')
+  const hotelCategory = validHotelCategory(stringValue(raw.hotelCategory) ?? stringValue(raw.hotel_category))
+  return {
+    budget: stringValue(raw.budget),
+    travelDate: travelDate && !isPastDate(travelDate) ? travelDate : null,
+    days: numberValueFromAi(raw.days ?? raw.nights ?? raw.duration),
+    makkahNights: numberValueFromAi(raw.makkahNights ?? raw.makkah_nights),
+    madinahNights: numberValueFromAi(raw.madinahNights ?? raw.madinaNights ?? raw.madinah_nights ?? raw.madina_nights),
+    adults: numberValueFromAi(raw.adults),
+    children: numberValueFromAi(raw.children ?? raw.kids),
+    infants: numberValueFromAi(raw.infants),
+    elderly: stringValue(raw.elderly),
+    hotelCategory,
+    rooms: numberValueFromAi(raw.rooms),
+    roomSharing: stringValue(raw.roomSharing ?? raw.room_sharing ?? raw.roomType ?? raw.room_type),
+    vehicle: validUmrahVehicle(stringValue(raw.vehicle ?? raw.transport)),
+    ziyarat: booleanValueFromAi(raw.ziyarat),
+    selectedZiyarats: stringArrayFromAi(raw.selectedZiyarats ?? raw.selected_ziyarats),
+    makkahHotelQuery: stringValue(raw.makkahHotelQuery ?? raw.makkah_hotel ?? raw.makkahHotel),
+    madinahHotelQuery: stringValue(raw.madinahHotelQuery ?? raw.madinaHotelQuery ?? raw.madinah_hotel ?? raw.madina_hotel),
+    specialRequirements: stringValue(raw.specialRequirements ?? raw.special_requirements),
+  }
+}
+
+function mergeUmrahDetails(base: ParsedUmrahDetails, ai: Partial<ParsedUmrahDetails>): ParsedUmrahDetails {
+  return {
+    budget: ai.budget ?? base.budget,
+    travelDate: ai.travelDate ?? base.travelDate,
+    days: ai.days ?? base.days,
+    makkahNights: ai.makkahNights ?? base.makkahNights,
+    madinahNights: ai.madinahNights ?? base.madinahNights,
+    adults: ai.adults ?? base.adults,
+    children: ai.children ?? base.children,
+    infants: ai.infants ?? base.infants,
+    elderly: ai.elderly ?? base.elderly,
+    hotelCategory: ai.hotelCategory ?? base.hotelCategory,
+    rooms: ai.rooms ?? base.rooms,
+    roomSharing: ai.roomSharing ?? base.roomSharing,
+    vehicle: ai.vehicle ?? base.vehicle,
+    ziyarat: ai.ziyarat ?? base.ziyarat,
+    selectedZiyarats: ai.selectedZiyarats ?? base.selectedZiyarats,
+    makkahHotelQuery: ai.makkahHotelQuery ?? base.makkahHotelQuery,
+    madinahHotelQuery: ai.madinahHotelQuery ?? base.madinahHotelQuery,
+    specialRequirements: ai.specialRequirements ?? base.specialRequirements,
+  }
+}
+
+async function extractUmrahDetailsWithAi(
+  config: AiConfig,
+  messages: { role: string; content: string }[],
+): Promise<Partial<ParsedUmrahDetails>> {
+  const detailMessages = umrahDetailMessages(messages)
+    .filter((message) => message.role === 'user')
+    .slice(-12)
+  if (detailMessages.length === 0) return {}
+
+  const systemPrompt = [
+    'Extract structured Umrah package details from WhatsApp customer messages.',
+    'Return JSON only. Do not include markdown, explanations, or missing-field prompts.',
+    'Use null for unknown fields. Never invent unavailable details.',
+    'Understand flexible wording: couple=2 adults, kids/children, babies/infants, "add staria" means vehicle Staria, "add badar and taif ziyarat" means selected ziyarats ["badar","taif"], "change Makkah hotel to voco" means makkahHotelQuery "voco".',
+    'Normalize hotelCategory to Economy, Standard, or Executive. Normalize travelDate to yyyy-mm-dd when present. Use selectedZiyarats values from: makkah, madina, badar, taif.',
+    'Fields: budget, travelDate, days, makkahNights, madinahNights, adults, children, infants, elderly, hotelCategory, rooms, roomSharing, vehicle, ziyarat, selectedZiyarats, makkahHotelQuery, madinahHotelQuery, specialRequirements.',
+  ].join('\n')
+
+  try {
+    const result = await generateReply({
+      config,
+      systemPrompt,
+      messages: [{
+        role: 'user',
+        content: detailMessages.map((message) => message.content).join('\n---\n'),
+      }],
+    })
+    const json = extractJsonObject(result.text)
+    return json ? normalizeAiUmrahDetails(json) : {}
+  } catch (err) {
+    console.error('[ai auto-reply] umrah detail extraction failed:', err)
+    return {}
   }
 }
 
@@ -505,6 +686,17 @@ function availableUmrahHotelsText(data: Record<string, unknown>, categoryValue: 
   ].join('\n')
 }
 
+function findUmrahHotelId(data: Record<string, unknown>, city: string, query: string | null): string | null {
+  const needle = query?.trim().toLowerCase()
+  if (!needle) return null
+  const hotel = plannerRows(data, 'hotels').find((item) => {
+    const itemCity = String(item.city ?? '').toLowerCase()
+    const name = String(item.name ?? '').toLowerCase()
+    return itemCity.includes(city) && name.includes(needle)
+  })
+  return hotel?.id ? String(hotel.id) : null
+}
+
 function availableUmrahZiyaratsText(data: Record<string, unknown>): string {
   const ziyarats = plannerRows(data, 'ziyarats')
     .map((item) => String(item.name ?? item.id ?? '').trim())
@@ -548,8 +740,16 @@ function buildCurrentUmrahQuote(
       ? [details.makkahNights, Math.max(0, details.days - details.makkahNights)]
       : undefined
   const vehicle = details.specialRequirements?.match(/\b(shared shuttle|car|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car'
+  const selectedHotels = {
+    ...(findUmrahHotelId(plannerData, 'makkah', details.makkahHotelQuery) ? {
+      'Makkah-0': findUmrahHotelId(plannerData, 'makkah', details.makkahHotelQuery)!,
+    } : {}),
+    ...(findUmrahHotelId(plannerData, 'mad', details.madinahHotelQuery) ? {
+      'Madinah-1': findUmrahHotelId(plannerData, 'mad', details.madinahHotelQuery)!,
+    } : {}),
+  }
   return {
-    vehicle,
+    vehicle: details.vehicle ?? vehicle,
     quote: quoteUmrah({
       name: 'WhatsApp lead',
       phone: '',
@@ -565,9 +765,11 @@ function buildCurrentUmrahQuote(
       hotel_category: normalizedUmrahHotelCategory(options.hotelCategory ?? details.hotelCategory),
       budget: details.budget ?? undefined,
       hotel_preference: options.hotelPreference,
-      vehicle,
+      selected_hotels: selectedHotels,
+      vehicle: details.vehicle ?? vehicle,
       include_visa: true,
       include_ziyarat: details.ziyarat ?? false,
+      selected_ziyarats: details.selectedZiyarats?.length ? details.selectedZiyarats : undefined,
     }, plannerData),
   }
 }
@@ -587,7 +789,11 @@ function umrahLeadNotes(details: ParsedUmrahDetails, latestText: string): string
     details.hotelCategory ? `Hotel Category: ${details.hotelCategory}` : null,
     details.rooms ? `Rooms: ${details.rooms}` : null,
     details.roomSharing ? `Room Sharing: ${details.roomSharing}` : null,
+    details.vehicle ? `Vehicle: ${details.vehicle}` : null,
     details.ziyarat !== null ? `Ziyarat: ${details.ziyarat ? 'Required' : 'Not Required'}` : null,
+    details.selectedZiyarats?.length ? `Selected Ziyarats: ${details.selectedZiyarats.join(', ')}` : null,
+    details.makkahHotelQuery ? `Requested Makkah Hotel: ${details.makkahHotelQuery}` : null,
+    details.madinahHotelQuery ? `Requested Madina Hotel: ${details.madinahHotelQuery}` : null,
     details.specialRequirements ? `Special Requirements: ${details.specialRequirements}` : null,
     `Latest customer message: ${latestText}`,
   ].filter(Boolean).join('\n')
@@ -776,6 +982,7 @@ async function buildAiUmrahReply(args: {
   userId: string
   conversationId: string
   contactId: string
+  config: AiConfig
   latestText: string
   messages: { role: string; content: string }[]
 }): Promise<string | null> {
@@ -785,7 +992,10 @@ async function buildAiUmrahReply(args: {
   const alreadyAsked = args.messages.some((message) =>
     message.role === 'assistant' && message.content.includes('customized Umrah package'),
   )
-  const details = parseUmrahDetails(args.messages)
+  const details = mergeUmrahDetails(
+    parseUmrahDetails(args.messages),
+    await extractUmrahDetailsWithAi(args.config, args.messages),
+  )
   const missing = missingUmrahFields(details)
   const invalidDateMessage = invalidLatestUmrahDateMessage(args.latestText)
   if (invalidDateMessage) {
@@ -1107,6 +1317,7 @@ export async function dispatchInboundToAiReply(
       userId: configOwnerUserId,
       conversationId,
       contactId,
+      config,
       latestText,
       messages,
     })

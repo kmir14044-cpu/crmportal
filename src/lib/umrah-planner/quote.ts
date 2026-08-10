@@ -411,7 +411,11 @@ export function quoteUmrah(input: UmrahQuoteInput, data: JsonRecord = defaultDat
     : ['makkah', 'madina']
   const ziyarats = (input.include_ziyarat ? selectedZiyaratIds : [])
     .map((id) => {
-      const source = rows(data, 'ziyarats').find((item) => item.id === id)
+      const source = rows(data, 'ziyarats').find((item) => {
+        const itemId = norm(item.id)
+        const itemName = norm(item.name)
+        return itemId === norm(id) || itemName.includes(norm(id))
+      })
       const fallbackName = id === 'madina' ? 'Madina Ziyarat' : id === 'makkah' ? 'Makkah Ziyarat' : `${id} Ziyarat`
       const amountSar = numberValue(source?.price ?? source?.price_sar, id === 'madina' ? 1200 : 250)
       return { id, name: String(source?.name ?? fallbackName), amount: sarToPkr(data, amountSar) }
