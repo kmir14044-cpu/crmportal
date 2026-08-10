@@ -78,6 +78,7 @@ interface ParsedUmrahDetails {
   rooms: number | null
   roomSharing: string | null
   vehicle: string | null
+  includeTransport: boolean | null
   ziyarat: boolean | null
   selectedZiyarats: string[] | null
   makkahHotelQuery: string | null
@@ -356,7 +357,7 @@ function latestHotelCategoryFromMessages(messages: { role: string; content: stri
 }
 
 function validUmrahVehicle(value: string | undefined | null): string | null {
-  const match = value?.match(/\b(shared shuttle|staria|gmc|hiace|coaster|car)\b/i)?.[1]
+  const match = value?.match(/\b(shared shuttle|suv|staria|gmc|hiace|coaster|car)\b/i)?.[1]
   return match ? titleCase(match) : null
 }
 
@@ -364,9 +365,22 @@ function latestVehicleFromMessages(messages: { role: string; content: string }[]
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i]
     if (message.role !== 'user') continue
-    if (!/\b(add|change|set|vehicle|transport|car|staria|gmc|hiace|coaster|shared shuttle)\b/i.test(message.content)) continue
+    if (!/\b(add|change|set|vehicle|vehcile|transport|car|suv|staria|gmc|hiace|coaster|shared shuttle)\b/i.test(message.content)) continue
     const value = validUmrahVehicle(message.content)
     if (value) return value
+  }
+  return null
+}
+
+
+function latestTransportPreferenceFromMessages(messages: { role: string; content: string }[]): boolean | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    if (message.role !== 'user') continue
+    const text = message.content
+    if (/\b(?:no|without|remove|exclude|skip|dont want|don't want|do not want)\b.{0,25}\b(?:transport|vehicle|vehcile|car)\b/i.test(text) ||
+        /\b(?:own|my own)\s+(?:transport|vehicle|car)\b/i.test(text)) return false
+    if (validUmrahVehicle(text) || /\b(?:include|add|need|want|required)\b.{0,25}\b(?:transport|vehicle|vehcile)\b/i.test(text)) return true
   }
   return null
 }
@@ -492,6 +506,7 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     rooms: parsedRooms,
     roomSharing: parsedRoomSharing,
     vehicle: latestVehicleFromMessages(userMessages),
+    includeTransport: latestTransportPreferenceFromMessages(userMessages),
     ziyarat: selectedZiyarats ? selectedZiyarats.length > 0 : parsedZiyarat,
     selectedZiyarats,
     makkahHotelQuery: latestHotelQueryFromMessages(userMessages, 'makkah'),
@@ -595,6 +610,7 @@ function normalizeAiUmrahDetails(raw: Record<string, unknown>): Partial<ParsedUm
     rooms: numberValueFromAi(raw.rooms),
     roomSharing: stringValue(raw.roomSharing ?? raw.room_sharing ?? raw.roomType ?? raw.room_type),
     vehicle: validUmrahVehicle(stringValue(raw.vehicle ?? raw.transport)),
+    includeTransport: booleanValueFromAi(raw.includeTransport ?? raw.include_transport ?? raw.transportIncluded ?? raw.transport_included),
     ziyarat: booleanValueFromAi(raw.ziyarat),
     selectedZiyarats: stringArrayFromAi(raw.selectedZiyarats ?? raw.selected_ziyarats),
     makkahHotelQuery: stringValue(raw.makkahHotelQuery ?? raw.makkah_hotel ?? raw.makkahHotel),
@@ -620,7 +636,10 @@ function mergeUmrahDetails(base: ParsedUmrahDetails, ai: Partial<ParsedUmrahDeta
     hotelCategory: ai.hotelCategory ?? base.hotelCategory,
     rooms: ai.rooms ?? base.rooms,
     roomSharing: ai.roomSharing ?? base.roomSharing,
-    vehicle: ai.vehicle ?? base.vehicle,
+    // Transport changes are parsed deterministically from the latest user messages.
+    // Prefer them over the AI extraction so old transport preferences cannot override a new 'no transport' / 'Hiace' command.
+    vehicle: base.vehicle ?? ai.vehicle,
+    includeTransport: base.includeTransport ?? ai.includeTransport,
     ziyarat: ai.ziyarat ?? base.ziyarat,
     selectedZiyarats: ai.selectedZiyarats ?? base.selectedZiyarats,
     makkahHotelQuery: ai.makkahHotelQuery ?? base.makkahHotelQuery,
@@ -643,9 +662,9 @@ async function extractUmrahDetailsWithAi(
     'Extract structured Umrah package details from WhatsApp customer messages.',
     'Return JSON only. Do not include markdown, explanations, or missing-field prompts.',
     'Use null for unknown fields. Never invent unavailable details.',
-    'Understand flexible wording: couple=2 adults, kids/children, babies/infants, "add staria" means vehicle Staria, "add badar and taif ziyarat" means selected ziyarats ["badar","taif"], "change Makkah hotel to voco" means makkahHotelQuery "voco".',
+    'Understand flexible wording: couple=2 adults, kids/children, babies/infants, "add staria" means vehicle Staria, "SUV" means vehicle SUV, "no transport" or "no vehicle" means includeTransport false, "add Hiace" means includeTransport true and vehicle Hiace, "add badar and taif ziyarat" means selected ziyarats ["badar","taif"], "change Makkah hotel to voco" means makkahHotelQuery "voco".',
     'Normalize hotelCategory to Economy, Standard, or Executive. Normalize travelDate to yyyy-mm-dd when present. Use selectedZiyarats values from: makkah, madina, badar, taif.',
-    'Fields: budget, travelDate, days, makkahNights, madinahNights, adults, children, infants, elderly, hotelCategory, rooms, roomSharing, vehicle, ziyarat, selectedZiyarats, makkahHotelQuery, madinahHotelQuery, hotelPreference, specialRequirements.',
+    'Fields: budget, travelDate, days, makkahNights, madinahNights, adults, children, infants, elderly, hotelCategory, rooms, roomSharing, vehicle, includeTransport, ziyarat, selectedZiyarats, makkahHotelQuery, madinahHotelQuery, hotelPreference, specialRequirements.',
   ].join('\n')
 
   try {
@@ -832,7 +851,7 @@ function buildCurrentUmrahQuote(
     : details.makkahNights && details.days
       ? [details.makkahNights, Math.max(0, details.days - details.makkahNights)]
       : undefined
-  const vehicle = details.specialRequirements?.match(/\b(shared shuttle|car|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car'
+  const vehicle = details.specialRequirements?.match(/\b(shared shuttle|car|suv|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car'
   const roomSetup = inferredRoomSetup(details)
   const selectedHotels = {
     ...(findUmrahHotelId(plannerData, 'makkah', details.makkahHotelQuery) ? {
@@ -861,6 +880,8 @@ function buildCurrentUmrahQuote(
       hotel_preference: options.hotelPreference ?? details.hotelPreference ?? 'cheapest',
       selected_hotels: selectedHotels,
       vehicle: details.vehicle ?? vehicle,
+      transport_mode: details.includeTransport === false ? 'selective' : 'full',
+      selected_sectors: details.includeTransport === false ? [] : undefined,
       include_visa: true,
       include_ziyarat: details.ziyarat ?? false,
       selected_ziyarats: details.selectedZiyarats?.length ? details.selectedZiyarats : undefined,
@@ -1544,16 +1565,26 @@ async function buildAiUmrahReply(args: {
     }
 
     const budget = budgetAmount(details.budget)
-    const quoteText = budget !== null && budget < quote.total
-      ? [
-          'Your shared budget is lower than the currently available Umrah package from live hotel and transport data.',
-          `Budget shared: PKR ${budget.toLocaleString('en-PK')}`,
-          `Suggested available package: ${quote.priceText}`,
-          '',
-          quote.whatsappText,
-        ].join('\n')
-      : quote.whatsappText
-    await upsertAiUmrahLead({ ...args, details, quoteText })
+    const hasPreviousQuote = args.messages.some((message) =>
+      message.role === 'assistant' && /Tours in Pakistan Umrah quotation/i.test(message.content),
+    )
+
+    // First completed request gets the full quotation. Later package changes get a
+    // short, contextual WhatsApp response matching exactly what the customer changed;
+    // the full recalculated details remain in the attached PDF.
+    const quoteText = hasPreviousQuote
+      ? formatUmrahPackageUpdateReply({ latestText: args.latestText, quote, budget })
+      : budget !== null && budget < quote.total
+        ? [
+            'I’ve prepared your Umrah quotation according to the details you shared.',
+            `Estimated package: ${quote.priceText}.`,
+            `Your budget is PKR ${budget.toLocaleString('en-PK')}, so the current available package is above your budget.`,
+            '',
+            quote.whatsappText,
+          ].join('\n')
+        : quote.whatsappText
+
+    await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
     return {
       text: quoteText,
       document: await uploadUmrahQuotePdf({ db: args.db, accountId: args.accountId, quote }) ?? undefined,
@@ -1563,6 +1594,69 @@ async function buildAiUmrahReply(args: {
     await upsertAiUmrahLead({ ...args, details })
     return 'Thank you. I have received your Umrah details. Our team will verify the latest hotel availability and share the final package shortly.'
   }
+}
+
+
+function formatUmrahPackageUpdateReply(args: {
+  latestText: string
+  quote: UmrahQuoteResult
+  budget: number | null
+}): string {
+  const { latestText, quote, budget } = args
+  const text = latestText.trim()
+  const lines: Array<string | null> = []
+  const makkah = quote.hotelLines.find((line) => /makkah/i.test(line.city))
+  const madina = quote.hotelLines.find((line) => /madina|madinah/i.test(line.city))
+  const transportIncluded = quote.transportSectors.length > 0 && !/^not included$/i.test(quote.vehicle)
+
+  if (/\b(?:days?|nights?|duration)\b/i.test(text) || /^\s*\d{1,3}\s*(?:days?|nights?)?\s*$/i.test(text)) {
+    lines.push(`Done — I’ve updated your package duration to ${quote.nights} nights.`)
+    if (makkah || madina) {
+      lines.push([
+        makkah ? `Makkah: ${makkah.nights} nights` : null,
+        madina ? `Madina: ${madina.nights} nights` : null,
+      ].filter(Boolean).join(' | '))
+    }
+  } else if (/\b(date|travel date|departure|start)\b/i.test(text) || /\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(text)) {
+    lines.push(`Done — I’ve updated the travel date to ${quote.startDate}.`)
+    if (makkah && madina) lines.push(`Stay: ${makkah.nights} nights Makkah + ${madina.nights} nights Madina.`)
+  } else if (/\b(?:people|persons?|pax|travellers?|travelers?|adults?|children|kids|infants?|babies)\b/i.test(text)) {
+    lines.push(`Done — I’ve updated the passenger details to ${quote.travelers} traveler${quote.travelers === 1 ? '' : 's'}.`)
+    lines.push(`Room setup: ${quote.rooms} x ${quote.roomType}.`)
+  } else if (/\b(?:executive|standard|economy|hotel category|category)\b/i.test(text)) {
+    lines.push(`Done — I’ve updated the hotel category to ${quote.packageCategory}.`)
+    if (makkah) lines.push(`Makkah: ${makkah.hotel}.`)
+    if (madina) lines.push(`Madina: ${madina.hotel}.`)
+  } else if (/\bhotel\b/i.test(text)) {
+    lines.push('Done — I’ve updated the hotel selection.')
+    if (makkah) lines.push(`Makkah: ${makkah.hotel}.`)
+    if (madina) lines.push(`Madina: ${madina.hotel}.`)
+  } else if (/\b(?:no|without|remove|skip|dont|don't|do not)\b.{0,35}\b(?:transport|vehicle|car|vehcile)\b|\b(?:transport|vehicle|vehcile)\b.{0,25}\b(?:no|off|remove|without)\b/i.test(text)) {
+    lines.push(transportIncluded
+      ? `Done — transport has been updated to ${quote.vehicle}.`
+      : 'Done — I’ve removed transport from your Umrah package.')
+  } else if (/\b(?:vehicle|transport|vehcile|suv|car|staria|gmc|hiace|coaster|shared shuttle)\b/i.test(text)) {
+    lines.push(transportIncluded
+      ? `Done — I’ve updated the transport vehicle to ${quote.vehicle}.`
+      : 'Done — transport is not included in this package.')
+  } else if (/\b(?:ziyarat|ziyarats|badar|taif)\b/i.test(text)) {
+    lines.push(quote.ziyarats.length
+      ? `Done — I’ve updated the Ziyarat selection: ${quote.ziyarats.map((item) => item.name).join(', ')}.`
+      : 'Done — Ziyarat has been removed from the package.')
+  } else if (/\b(?:budget|pkr|rs\.?|lakh|lac)\b/i.test(text)) {
+    lines.push('Done — I’ve updated your budget and recalculated the available package.')
+  } else {
+    lines.push('Done — I’ve updated your Umrah package according to your latest request.')
+  }
+
+  lines.push(`Updated estimated total: ${quote.priceText}.`)
+
+  if (budget !== null && budget < quote.total) {
+    lines.push(`Your budget is PKR ${budget.toLocaleString('en-PK')}, so the currently available package is above budget by PKR ${Math.round(quote.total - budget).toLocaleString('en-PK')}.`)
+  }
+
+  lines.push('I’ve attached the updated quotation PDF.')
+  return lines.filter(Boolean).join('\n')
 }
 
 async function captureAiTravelLead(args: {

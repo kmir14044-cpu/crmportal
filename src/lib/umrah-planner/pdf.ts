@@ -148,7 +148,7 @@ export function buildUmrahQuotePdf(quote: UmrahQuoteResult): Uint8Array {
   text1(money(quote.total), M + 7, 635, 26, 'F2', GREEN)
   text1('Prepared for: WhatsApp Customer', 294, 675, 8.8, 'F2', GRAY)
   text1('Final price may vary based on availability and confirmation.', 294, 651, 7.8, 'F1', GRAY)
-  text1('Agency WhatsApp: +923703049245', 294, 625, 7.8, 'F1', GRAY)
+  text1('Agency WhatsApp: +923148148469', 294, 625, 7.8, 'F1', GRAY)
 
   // Duration / travelers / rooms grid.
   const gridY = 554
@@ -220,7 +220,7 @@ export function buildUmrahQuotePdf(quote: UmrahQuoteResult): Uint8Array {
     text1(row, M + 144, extrasTop - 39 - index * 12, 7.7, 'F1', DARK),
   )
 
-  text1('Tours in Pakistan | WhatsApp +923703049245 | toursinpakistan.com', M, 26, 7.2, 'F1', GRAY)
+  text1('Tours in Pakistan | WhatsApp +923148148469 | toursinpakistan.com', M, 26, 7.2, 'F1', GRAY)
   text1('Final booking subject to availability, supplier confirmation and payment clearance.', M, 14, 6.9, 'F1', GRAY)
   pages.push(page1.join('\n'))
 
@@ -260,7 +260,7 @@ export function buildUmrahQuotePdf(quote: UmrahQuoteResult): Uint8Array {
     ry -= lines.length * 14 + 10
   }
 
-  text2('Tours in Pakistan | WhatsApp +923703049245 | toursinpakistan.com', M, 26, 7.2, 'F1', GRAY)
+  text2('Tours in Pakistan | WhatsApp +923148148469 | toursinpakistan.com', M, 26, 7.2, 'F1', GRAY)
   text2('Final booking subject to availability, supplier confirmation and payment clearance.', M, 14, 6.9, 'F1', GRAY)
   pages.push(page2.join('\n'))
 
