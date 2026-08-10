@@ -41,6 +41,7 @@ export interface UmrahQuoteInput {
   rooms?: string | number
   room_type?: string
   hotel_category?: string
+  budget?: string | number
   selected_hotels?: Record<string, string>
   vehicle?: string
   transport_mode?: 'full' | 'selective'
@@ -264,11 +265,40 @@ function hotelStayCost(data: JsonRecord, hotel: JsonRecord | null, roomType: str
   return { totalSar, avgSar: nights ? Math.round(totalSar / nights) : 0, hasMissingRates }
 }
 
-function selectHotel(data: JsonRecord, city: string, categoryValue: string, hotelId?: string): JsonRecord | null {
+function stableIndex(seed: string, size: number): number {
+  if (size <= 1) return 0
+  let hash = 0
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0
+  }
+  return Math.abs(hash) % size
+}
+
+function selectHotel(
+  data: JsonRecord,
+  city: string,
+  categoryValue: string,
+  roomType: string,
+  checkIn: Date | null,
+  nights: number,
+  childAges: number[],
+  seed: string,
+  hotelId?: string,
+): JsonRecord | null {
   const hotels = rows(data, 'hotels').filter((hotel) => norm(hotel.city) === norm(city))
   if (hotelId) return hotels.find((hotel) => hotel.id === hotelId) ?? null
-  const preferred = hotels.filter((hotel) => category(hotel.category) === categoryValue && (hotel.seasonRates as unknown[] | undefined)?.length)
-  return preferred[0] ?? hotels.find((hotel) => (hotel.seasonRates as unknown[] | undefined)?.length) ?? hotels[0] ?? null
+  const preferred = hotels
+    .filter((hotel) => category(hotel.category) === categoryValue && (hotel.seasonRates as unknown[] | undefined)?.length)
+    .map((hotel) => ({
+      hotel,
+      stay: hotelStayCost(data, hotel, roomType, checkIn, nights, childAges),
+    }))
+  const available = preferred.filter((item) => item.stay.totalSar > 0 && !item.stay.hasMissingRates)
+  const pool = (available.length ? available : preferred)
+    .sort((a, b) => a.stay.totalSar - b.stay.totalSar)
+  if (pool.length) return pool[stableIndex(seed, pool.length)].hotel
+  const fallback = hotels.filter((hotel) => (hotel.seasonRates as unknown[] | undefined)?.length)
+  return fallback[stableIndex(seed, fallback.length)] ?? hotels[stableIndex(seed, hotels.length)] ?? null
 }
 
 function defaultTransportSectors(sequence: string[]): string[] {
@@ -319,7 +349,29 @@ export function quoteUmrah(input: UmrahQuoteInput, data: JsonRecord = defaultDat
 
   const hotelLines = stops.map((stop) => {
     const hotelKey = `${stop.city}-${stop.index}`
-    const hotel = selectHotel(data, stop.city, normalizedCategory, selectedHotels[hotelKey])
+    const hotel = selectHotel(
+      data,
+      stop.city,
+      normalizedCategory,
+      roomType,
+      stop.checkIn,
+      stop.nights,
+      childAges,
+      [
+        stop.city,
+        stop.index,
+        input.start_date,
+        input.nights,
+        adults,
+        children,
+        infants,
+        roomsCount,
+        roomType,
+        input.hotel_category,
+        input.budget,
+      ].join('|'),
+      selectedHotels[hotelKey],
+    )
     const stay = hotelStayCost(data, hotel, roomType, stop.checkIn, stop.nights, childAges)
     return {
       city: stop.city,

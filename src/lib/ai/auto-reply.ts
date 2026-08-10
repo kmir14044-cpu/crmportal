@@ -43,7 +43,7 @@ const UMRAH_INTAKE_MESSAGE = [
   '📅 Travel Dates',
   '🗓️ No. of Days',
   '👥 No. of Travelers (Adults / Kids / Infants / Elderly with ages)',
-  '🏨 Hotel Category (Economy / Economy Plus / 4⭐ / 5⭐)',
+  '🏨 Hotel Category (Economy / Standard / Executive)',
   '🛏️ No. of Hotel Rooms (Please mention room sharing)',
   '🕌 Makkah & Madinah Ziyarat (Required / Not Required)',
   '✈️ Special Requirements (Flight, transport, hotel distance, or any other preference)',
@@ -67,6 +67,8 @@ interface ParsedUmrahDetails {
   budget: string | null
   travelDate: string | null
   days: number | null
+  makkahNights: number | null
+  madinahNights: number | null
   adults: number | null
   children: number | null
   infants: number | null
@@ -153,11 +155,67 @@ function conversationText(messages: { role: string; content: string }[]): string
 
 function parseDateText(text: string): string | null {
   const iso = text.match(/\b(20\d{2}-\d{1,2}-\d{1,2})\b/)
-  if (iso) return iso[1]
+  if (iso) {
+    const [year, month, day] = iso[1].split('-').map(Number)
+    return validIsoDate(year, month, day)
+  }
   const natural = text.match(
     /\b(\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+20\d{2})\b/i,
   )
-  return natural?.[1] ?? null
+  if (!natural) return null
+  const match = natural[1].match(/^(\d{1,2})\s+([a-z]+)\s+(20\d{2})$/i)
+  if (!match) return natural[1]
+  const months: Record<string, string> = {
+    jan: '01', january: '01',
+    feb: '02', february: '02',
+    mar: '03', march: '03',
+    apr: '04', april: '04',
+    may: '05',
+    jun: '06', june: '06',
+    jul: '07', july: '07',
+    aug: '08', august: '08',
+    sep: '09', september: '09',
+    oct: '10', october: '10',
+    nov: '11', november: '11',
+    dec: '12', december: '12',
+  }
+  const month = months[match[2].toLowerCase()]
+  return month ? validIsoDate(Number(match[3]), Number(month), Number(match[1])) : null
+}
+
+function validIsoDate(year: number, month: number, day: number): string | null {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return null
+  const date = new Date(Date.UTC(year, month - 1, day))
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) return null
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
+}
+
+function isPastDate(value: string | null): boolean {
+  if (!value) return false
+  const [year, month, day] = value.split('-').map(Number)
+  const date = new Date(Date.UTC(year, month - 1, day))
+  const now = new Date()
+  const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()))
+  return date < today
+}
+
+function latestValidDate(messages: { role: string; content: string }[], fallbackText: string): string | null {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i]
+    if (message.role !== 'user') continue
+    const parsed = parseDateText(message.content)
+    if (parsed && !isPastDate(parsed)) return parsed
+  }
+  const fallback = parseDateText(fallbackText)
+  return fallback && !isPastDate(fallback) ? fallback : null
+}
+
+function hasDateLikeText(text: string): boolean {
+  return /\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}\s+[a-z]{3,}\s+20\d{2})\b/i.test(text)
 }
 
 function parseBoolPreference(value: string): boolean | null {
@@ -166,9 +224,99 @@ function parseBoolPreference(value: string): boolean | null {
   return null
 }
 
+function userDetailLines(messages: { role: string; content: string }[]): string[] {
+  const intakeIndex = messages.findIndex((message) =>
+    message.role === 'assistant' && message.content.includes('customized Umrah package'),
+  )
+  return messages
+    .slice(Math.max(0, intakeIndex + 1))
+    .filter((message) => message.role === 'user' && !/^\s*umrah\s*$/i.test(message.content))
+    .flatMap((message) => message.content.split(/\r?\n/))
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/\bchange\b/i.test(line))
+}
+
+function firstNumber(value: string | undefined): number | null {
+  return parseIntText(value?.match(/\b(\d{1,4})\b/)?.[1])
+}
+
+function validHotelCategory(value: string | undefined | null): string | null {
+  const match = value?.match(/\b(economy plus|economy|4\s*⭐|4\s*star|four\s*star|5\s*⭐|5\s*star|five\s*star|standard|executive)\b/i)?.[1]
+  return match ? titleCase(match) : null
+}
+
+function roomCountFromText(value: string | undefined | null): number | null {
+  if (!value) return null
+  if (!/\b(rooms?|room|single|double|triple|quad|sharing)\b/i.test(value)) return null
+  return firstNumber(value) ?? (/double/i.test(value) ? 1 : null)
+}
+
+function likelyUsefulUmrahAnswer(text: string): boolean {
+  return Boolean(
+    budgetAmount(text) ||
+    hasDateLikeText(text) ||
+    /\b(days?|nights?|adults?|persons?|people|pax|passengers?|kids?|children|child|infants?|babies|elderly|senior|rooms?|room|single|double|triple|quad|sharing|economy|standard|executive|ziyarat|required|not required|yes|no|flight|transport|hotel distance|near haram|wheelchair)\b/i.test(text),
+  )
+}
+
 function parseUmrahDetails(messages: { role: string; content: string }[]): ParsedUmrahDetails {
   const text = conversationText(messages)
   const latest = [...messages].reverse().find((message) => message.role === 'user')?.content ?? ''
+  const lines = userDetailLines(messages)
+  const ordered = lines.length >= 5 ? {
+    budget: lines[0],
+    travelDate: lines[1],
+    days: lines[2],
+    travelers: lines[3],
+    hotelCategory: lines[4],
+    rooms: lines[5],
+    ziyarat: lines[6],
+    specialRequirements: lines.slice(7).join(' '),
+  } : null
+  const parsedBudget = text.match(/\b(?:budget|range)\s*[:\-]?\s*(?:pkr|rs\.?|₨)?\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
+    ?? text.match(/\b([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)\s*(?:budget|range)\b/i)?.[1]
+    ?? text.match(/\b(?:pkr|rs\.?|₨)\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
+    ?? (/^\d[\d,.\s]*(?:k|lac|lakh|million|m)?$/i.test(ordered?.budget ?? '') ? ordered?.budget : null)
+    ?? null
+  const parsedDays = parseIntText(text.match(/\b(\d{1,3})\s*(?:days?|nights?)\b/i)?.[1]) ?? firstNumber(ordered?.days)
+  const parsedAdults = parseIntText(text.match(/\b(\d{1,3})\s*(?:adults?|persons?|people|pax|passengers?)\b/i)?.[1])
+    ?? firstNumber(ordered?.travelers)
+  const parsedChildren = parseIntText(text.match(/\b(\d{1,3})\s*(?:kids?|children|child)\b/i)?.[1])
+  const parsedInfants = parseIntText(text.match(/\b(\d{1,3})\s*(?:infants?|babies|baby)\b/i)?.[1])
+  const parsedRooms = parseIntText(text.match(/\b(\d{1,3})\s*(?:\w+\s+){0,3}(?:rooms?|room)\b/i)?.[1])
+    ?? roomCountFromText(ordered?.rooms)
+  const parsedHotelCategory = validHotelCategory(text) ?? validHotelCategory(ordered?.hotelCategory)
+  const parsedZiyarat = parseBoolPreference(
+    text.match(/\b(?:ziyarat|ziyarats)\s*[:\-]?\s*([a-z\s/]+)\b/i)?.[1] ?? ordered?.ziyarat ?? latest,
+  )
+  const parsedElderly = text.match(/\b(?:elderly|senior)[^,\n.]*/i)?.[0] ?? null
+  const parsedRoomSharing = text.match(/\b(?:sharing|double|triple|quad|single)[^,\n.]*/i)?.[0] ?? ordered?.rooms ?? null
+  const parsedSpecialRequirements =
+    (text.match(/\b(?:special requirements?|requirements?|preference)\s*[:\-]\s*([^\n]+)/i)?.[1] ??
+    text.match(/\b(flight|transport|near haram|walking distance|wheelchair|hotel distance)[^.\n]*/i)?.[0] ??
+    ordered?.specialRequirements) ||
+    null
+  const madinahNights = parseIntText(latest.match(/\b(?:madina|madinah)[^\d]{0,30}(\d{1,3})\b/i)?.[1])
+  const makkahNights = parseIntText(latest.match(/\bmakkah[^\d]{0,30}(\d{1,3})\b/i)?.[1])
+
+  return {
+    budget: parsedBudget?.trim() ?? null,
+    travelDate: latestValidDate(messages, ordered?.travelDate ?? text),
+    days: parsedDays,
+    makkahNights,
+    madinahNights,
+    adults: parsedAdults,
+    children: parsedChildren,
+    infants: parsedInfants,
+    elderly: parsedElderly,
+    hotelCategory: parsedHotelCategory,
+    rooms: parsedRooms,
+    roomSharing: parsedRoomSharing,
+    ziyarat: parsedZiyarat,
+    specialRequirements: parsedSpecialRequirements?.trim() ?? null,
+  }
+
   const budget = text.match(/\b(?:budget|range)\s*[:\-]?\s*(?:pkr|rs\.?|₨)?\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
     ?? text.match(/\b(?:pkr|rs\.?|₨)\s*([0-9][0-9,.\s]*(?:k|lac|lakh|million|m)?)/i)?.[1]
     ?? null
@@ -193,11 +341,13 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     budget: budget?.trim() ?? null,
     travelDate: parseDateText(text),
     days,
+    makkahNights: null,
+    madinahNights: null,
     adults,
     children,
     infants,
     elderly,
-    hotelCategory: hotelCategory ? titleCase(hotelCategory) : null,
+    hotelCategory: hotelCategory ? titleCase(hotelCategory ?? undefined) : null,
     rooms,
     roomSharing,
     ziyarat,
@@ -219,7 +369,7 @@ function formatMissingUmrahPrompt(missing: UmrahRequiredField[]): string {
     travelDate: '📅 Travel Dates',
     days: '🗓️ No. of Days',
     travelers: '👥 No. of Travelers (Adults / Kids / Infants / Elderly with ages)',
-    hotelCategory: '🏨 Hotel Category (Economy / Economy Plus / 4⭐ / 5⭐)',
+    hotelCategory: '🏨 Hotel Category (Economy / Standard / Executive)',
     rooms: '🛏️ No. of Hotel Rooms (Please mention room sharing)',
     ziyarat: '🕌 Makkah & Madinah Ziyarat (Required / Not Required)',
   }
@@ -232,11 +382,48 @@ function formatMissingUmrahPrompt(missing: UmrahRequiredField[]): string {
   ].join('\n')
 }
 
+function formatInvalidUmrahAnswerPrompt(missing: UmrahRequiredField[]): string {
+  return [
+    'I could not use that answer for the Umrah package details.',
+    '',
+    'Please send the required details in a clear format. For example:',
+    'Budget: 400000',
+    'Travel Dates: yyyy-mm-dd',
+    'No. of Days: 10',
+    'Travelers: 2 adults, 0 kids, 0 infants',
+    'Hotel Category: Economy / Standard / Executive',
+    'Rooms: 1 double room',
+    'Ziyarat: Required / Not Required',
+    '',
+    missing.length ? formatMissingUmrahPrompt(missing) : 'If you want to change something, please mention the exact field and new value.',
+  ].join('\n')
+}
+
+function invalidLatestUmrahDateMessage(latestText: string): string | null {
+  if (!hasDateLikeText(latestText)) return null
+  const parsed = parseDateText(latestText)
+  if (!parsed) return 'Please enter a valid travel date in yyyy-mm-dd format, for example 2026-09-15.'
+  if (isPastDate(parsed)) return 'This travel date is in the past. Please enter a current or future travel date in yyyy-mm-dd format.'
+  return null
+}
+
 function normalizedUmrahHotelCategory(value: string | null): string {
   const text = value?.toLowerCase() ?? ''
   if (text.includes('5') || text.includes('executive')) return 'Executive'
   if (text.includes('4') || text.includes('plus') || text.includes('standard')) return 'Standard'
   return 'Economy'
+}
+
+function budgetAmount(value: string | null): number | null {
+  if (!value) return null
+  const normalized = value.toLowerCase().replace(/,/g, '').trim()
+  const raw = normalized.match(/\d+(?:\.\d+)?/)?.[0]
+  const amount = raw ? Number.parseFloat(raw) : Number.NaN
+  if (!Number.isFinite(amount)) return null
+  if (/\b(lac|lakh)\b/.test(normalized)) return Math.round(amount * 100000)
+  if (/\b(m|million)\b/.test(normalized)) return Math.round(amount * 1000000)
+  if (/\bk\b/.test(normalized)) return Math.round(amount * 1000)
+  return Math.round(amount)
 }
 
 function umrahLeadNotes(details: ParsedUmrahDetails, latestText: string): string {
@@ -245,6 +432,8 @@ function umrahLeadNotes(details: ParsedUmrahDetails, latestText: string): string
     details.budget ? `Budget: ${details.budget}` : null,
     details.travelDate ? `Travel Dates: ${details.travelDate}` : null,
     details.days ? `No. of Days: ${details.days}` : null,
+    details.makkahNights ? `Makkah Nights: ${details.makkahNights}` : null,
+    details.madinahNights ? `Madina Nights: ${details.madinahNights}` : null,
     details.adults !== null ? `Adults: ${details.adults}` : null,
     details.children !== null ? `Kids: ${details.children}` : null,
     details.infants !== null ? `Infants: ${details.infants}` : null,
@@ -452,6 +641,24 @@ async function buildAiUmrahReply(args: {
   )
   const details = parseUmrahDetails(args.messages)
   const missing = missingUmrahFields(details)
+  const invalidDateMessage = invalidLatestUmrahDateMessage(args.latestText)
+  if (invalidDateMessage) {
+    await upsertAiUmrahLead({ ...args, details })
+    return invalidDateMessage
+  }
+  const wantsHotelChange = /\bchange\b.*\bhotel\b|\bhotel\b.*\bchange\b/i.test(args.latestText)
+  if (wantsHotelChange && !/\b(al\s+|hotel|tower|towers|makkah|madina|madinah)\b.{0,80}\b(to|as|with)\b/i.test(args.latestText)) {
+    await upsertAiUmrahLead({ ...args, details })
+    return [
+      'Sure. Please tell me which hotel you want to change.',
+      '',
+      'Example:',
+      'Makkah hotel: hotel name or preferred area',
+      'Madina hotel: hotel name or preferred area',
+      '',
+      'If you only want to change the category, reply with Economy / Standard / Executive.',
+    ].join('\n')
+  }
 
   if (!alreadyAsked && missing.length > 0) {
     await upsertAiUmrahLead({ ...args, details })
@@ -460,28 +667,48 @@ async function buildAiUmrahReply(args: {
 
   if (missing.length > 0) {
     await upsertAiUmrahLead({ ...args, details })
+    if (alreadyAsked && !likelyUsefulUmrahAnswer(args.latestText)) {
+      return formatInvalidUmrahAnswerPrompt(missing)
+    }
     return formatMissingUmrahPrompt(missing)
   }
 
   try {
+    const stopNights = details.madinahNights && details.days
+      ? [Math.max(0, details.days - details.madinahNights), details.madinahNights]
+      : details.makkahNights && details.days
+        ? [details.makkahNights, Math.max(0, details.days - details.makkahNights)]
+        : undefined
     const quote = quoteUmrah({
       name: 'WhatsApp lead',
       phone: '',
       start_date: details.travelDate!,
       route_preset_id: 'mk-md',
       nights: details.days!,
+      stop_nights: stopNights,
       adults: details.adults ?? 1,
       children: details.children ?? 0,
       infants: details.infants ?? 0,
       rooms: details.rooms ?? 1,
       room_type: details.roomSharing?.match(/\b(single|double|triple|quad)\b/i)?.[1] ?? 'Double',
       hotel_category: normalizedUmrahHotelCategory(details.hotelCategory),
+      budget: details.budget ?? undefined,
       vehicle: details.specialRequirements?.match(/\b(shared shuttle|car|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car',
       include_visa: true,
       include_ziyarat: details.ziyarat ?? false,
     }, await loadUmrahPlannerDataForAccount(args.db, args.accountId))
-    await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
-    return quote.whatsappText
+    const budget = budgetAmount(details.budget)
+    const quoteText = budget !== null && budget < quote.total
+      ? [
+          'Your shared budget is lower than the currently available Umrah package from live hotel and transport data.',
+          `Budget shared: PKR ${budget.toLocaleString('en-PK')}`,
+          `Suggested available package: ${quote.priceText}`,
+          '',
+          quote.whatsappText,
+        ].join('\n')
+      : quote.whatsappText
+    await upsertAiUmrahLead({ ...args, details, quoteText })
+    return quoteText
   } catch (err) {
     console.error('[ai auto-reply] umrah quote failed:', err)
     await upsertAiUmrahLead({ ...args, details })
@@ -803,3 +1030,5 @@ export async function dispatchInboundToAiReply(
     console.error('[ai auto-reply] dispatch failed:', err)
   }
 }
+
+
