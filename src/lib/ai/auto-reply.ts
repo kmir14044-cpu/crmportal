@@ -55,13 +55,9 @@ const UMRAH_INTAKE_MESSAGE = [
 ].join('\n')
 
 const UMRAH_REQUIRED_FIELDS = [
-  'budget',
   'travelDate',
-  'days',
   'travelers',
   'hotelCategory',
-  'rooms',
-  'ziyarat',
 ] as const
 
 type UmrahRequiredField = (typeof UMRAH_REQUIRED_FIELDS)[number]
@@ -637,23 +633,18 @@ async function extractUmrahDetailsWithAi(
 function missingUmrahFields(details: ParsedUmrahDetails): UmrahRequiredField[] {
   return UMRAH_REQUIRED_FIELDS.filter((field) => {
     if (field === 'travelers') return !details.adults && !details.children && !details.infants && !details.elderly
-    if (field === 'ziyarat') return details.ziyarat === null
     return !details[field]
   })
 }
 
 function formatMissingUmrahPrompt(missing: UmrahRequiredField[]): string {
   const labels: Record<UmrahRequiredField, string> = {
-    budget: 'Budget, for example 400000',
-    travelDate: 'Travel date, for example 2026-09-15',
-    days: 'No. of days, for example 10',
-    travelers: 'Travelers, for example 2 adults',
+    travelDate: 'Travel date',
+    travelers: 'Number of travelers',
     hotelCategory: 'Hotel category: Economy / Standard / Executive',
-    rooms: 'Rooms, for example 1 double room',
-    ziyarat: 'Ziyarat: Required or Not Required',
   }
   return [
-    missing.length === 1 ? 'Just one detail missing:' : 'Please share these missing details:',
+    missing.length === 1 ? 'Just one thing needed:' : 'Please share these details so I can prepare the package:',
     '',
     ...missing.map((field) => labels[field]),
   ].join('\n')
@@ -781,6 +772,21 @@ function isInformationalQuestion(text: string): boolean {
   return /\?/.test(text) || /^(what|which|tell me|can you|do you|is there|are there|how|why)\b/i.test(text.trim())
 }
 
+function inferredRoomSetup(details: ParsedUmrahDetails): { rooms: number; roomType: string } {
+  const travelers = Math.max(1, (details.adults ?? 0) + (details.children ?? 0))
+  const explicitType = details.roomSharing?.match(/\b(single|double|triple|quad)\b/i)?.[1]
+  if (details.rooms || explicitType) {
+    return {
+      rooms: details.rooms ?? 1,
+      roomType: explicitType ? titleCase(explicitType) ?? 'Double' : 'Double',
+    }
+  }
+  if (travelers <= 1) return { rooms: 1, roomType: 'Single' }
+  if (travelers === 2) return { rooms: 1, roomType: 'Double' }
+  if (travelers === 3) return { rooms: 1, roomType: 'Triple' }
+  return { rooms: Math.ceil(travelers / 4), roomType: 'Quad' }
+}
+
 function buildCurrentUmrahQuote(
   details: ParsedUmrahDetails,
   plannerData: Record<string, unknown>,
@@ -792,6 +798,7 @@ function buildCurrentUmrahQuote(
       ? [details.makkahNights, Math.max(0, details.days - details.makkahNights)]
       : undefined
   const vehicle = details.specialRequirements?.match(/\b(shared shuttle|car|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car'
+  const roomSetup = inferredRoomSetup(details)
   const selectedHotels = {
     ...(findUmrahHotelId(plannerData, 'makkah', details.makkahHotelQuery) ? {
       'Makkah-0': findUmrahHotelId(plannerData, 'makkah', details.makkahHotelQuery)!,
@@ -807,13 +814,13 @@ function buildCurrentUmrahQuote(
       phone: '',
       start_date: details.travelDate!,
       route_preset_id: 'mk-md',
-      nights: details.days!,
+      nights: details.days ?? 10,
       stop_nights: stopNights,
       adults: details.adults ?? 1,
       children: details.children ?? 0,
       infants: details.infants ?? 0,
-      rooms: details.rooms ?? 1,
-      room_type: details.roomSharing?.match(/\b(single|double|triple|quad)\b/i)?.[1] ?? 'Double',
+      rooms: roomSetup.rooms,
+      room_type: roomSetup.roomType,
       hotel_category: normalizedUmrahHotelCategory(options.hotelCategory ?? details.hotelCategory),
       budget: details.budget ?? undefined,
       hotel_preference: options.hotelPreference,
@@ -848,22 +855,14 @@ async function uploadUmrahQuotePdf(args: {
     return null
   }
 
-  const signed = await args.db.storage.from(bucket).createSignedUrl(path, 60 * 60 * 24)
-  if (signed.error || !signed.data?.signedUrl) {
-    const { data } = args.db.storage.from(bucket).getPublicUrl(path)
-    if (!data.publicUrl) {
-      console.error('[ai auto-reply] quote PDF URL failed:', signed.error)
-      return null
-    }
-    return {
-      link: data.publicUrl,
-      filename: 'Umrah Quotation.pdf',
-      caption: 'Your Umrah quotation PDF is attached.',
-    }
+  const { data } = args.db.storage.from(bucket).getPublicUrl(path)
+  if (!data.publicUrl) {
+    console.error('[ai auto-reply] quote PDF public URL failed')
+    return null
   }
 
   return {
-    link: signed.data.signedUrl,
+    link: data.publicUrl,
     filename: 'Umrah Quotation.pdf',
     caption: 'Your Umrah quotation PDF is attached.',
   }

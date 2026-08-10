@@ -242,6 +242,8 @@ export async function engineSendMedia(
     sender_type: 'bot',
     content_type: args.kind,
     content_text: args.caption ?? null,
+    media_url: args.link,
+    filename: args.filename ?? null,
     message_id: waMessageId,
     status: 'sent',
   })
