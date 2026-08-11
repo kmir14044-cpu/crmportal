@@ -322,31 +322,13 @@ function latestBudgetFromMessages(messages: { role: string; content: string }[])
   return null
 }
 
-function daysToHotelNights(days: number | null): number | null {
-  if (days === null) return null
-  return Math.max(1, days - 1)
-}
-
-function durationNightsFromText(text: string): number | null {
-  const explicit = text.match(/\b(\d{1,3})\s*(days?|nights?)\b/i)
-  if (explicit) {
-    const value = parseIntText(explicit[1])
-    if (value === null) return null
-    return /^day/i.test(explicit[2]) ? daysToHotelNights(value) : value
-  }
-
-  const command = text.match(/\b(?:increase|extend|make|reduce|change|set|update|duration)\b[^\d]{0,40}(\d{1,3})\s*(days?|nights?)?/i)
-  if (command) {
-    const value = parseIntText(command[1])
-    if (value === null) return null
-    return command[2] && /^night/i.test(command[2]) ? value : daysToHotelNights(value)
-  }
-  return null
-}
-
 function latestDaysOverride(text: string): number | null {
-  if (!/\b(reduce|change|set|update|duration|days?|nights?|increase|extend|make)\b/i.test(text)) return null
-  return durationNightsFromText(text)
+  if (!/\b(reduce|change|set|update|duration|days?|nights?)\b/i.test(text)) return null
+  return parseIntText(
+    text.match(/\b(?:increase|extend|make)[^\d]{0,40}(\d{1,3})\b/i)?.[1] ??
+    text.match(/\b(?:reduce|change|set|update|duration|days?|nights?)[^\d]{0,40}(\d{1,3})\b/i)?.[1] ??
+    text.match(/\b(\d{1,3})\s*(?:days?|nights?)\b/i)?.[1],
+  )
 }
 
 function latestDaysFromMessages(messages: { role: string; content: string }[]): number | null {
@@ -481,11 +463,10 @@ function parseUmrahDetails(messages: { role: string; content: string }[]): Parse
     ?? (/^\d[\d,.\s]*(?:k|lac|lakh|million|m)?$/i.test(ordered?.budget ?? '') ? ordered?.budget : null)
     ?? (/^\d[\d,.\s]*(?:k|lac|lakh|million|m)?$/i.test(lines[0] ?? '') ? lines[0] : null)
     ?? null
-  const orderedDuration = firstNumber(ordered?.days)
   const parsedDays =
     latestDaysFromMessages(detailMessages) ??
-    durationNightsFromText(text) ??
-    daysToHotelNights(orderedDuration)
+    parseIntText(text.match(/\b(\d{1,3})\s*(?:days?|nights?)\b/i)?.[1]) ??
+    firstNumber(ordered?.days)
   const parsedAdults = parseIntText(text.match(/\b(\d{1,3})\s*(?:adults?|persons?|people|pax|passengers?)\b/i)?.[1])
     ?? wordNumber(text.match(/\b([a-z]+)\s+(?:adults?|persons?|people|pax|passengers?)\b/i)?.[1])
     ?? (/\bcouple\b/i.test(text) ? 2 : null)
@@ -646,8 +627,7 @@ function mergeUmrahDetails(base: ParsedUmrahDetails, ai: Partial<ParsedUmrahDeta
   return {
     budget: ai.budget ?? base.budget,
     travelDate: ai.travelDate ?? base.travelDate,
-    // Duration is deterministic: customer 'N days' means N-1 hotel nights; explicit 'N nights' stays N.
-    days: base.days ?? ai.days ?? null,
+    days: ai.days ?? base.days,
     makkahNights: ai.makkahNights ?? base.makkahNights,
     madinahNights: ai.madinahNights ?? base.madinahNights,
     adults: ai.adults ?? base.adults,
@@ -684,7 +664,7 @@ async function extractUmrahDetailsWithAi(
     'Return JSON only. Do not include markdown, explanations, or missing-field prompts.',
     'Use null for unknown fields. Never invent unavailable details.',
     'Understand flexible wording: couple=2 adults, kids/children, babies/infants, "add staria" means vehicle Staria, "SUV" means vehicle SUV, "no transport" or "no vehicle" means includeTransport false, "add Hiace" means includeTransport true and vehicle Hiace, "add badar and taif ziyarat" means selected ziyarats ["badar","taif"], "change Makkah hotel to voco" means makkahHotelQuery "voco".',
-    'Normalize hotelCategory to Economy, Standard, or Executive. Normalize travelDate to yyyy-mm-dd when present. IMPORTANT duration rule: if customer says N days, store days as N-1 hotel nights; if customer explicitly says N nights, store N. Use selectedZiyarats values from: makkah, madina, badar, taif.',
+    'Normalize hotelCategory to Economy, Standard, or Executive. Normalize travelDate to yyyy-mm-dd when present. Use selectedZiyarats values from: makkah, madina, badar, taif.',
     'Fields: budget, travelDate, days, makkahNights, madinahNights, adults, children, infants, elderly, hotelCategory, rooms, roomSharing, vehicle, includeTransport, ziyarat, selectedZiyarats, makkahHotelQuery, madinahHotelQuery, hotelPreference, specialRequirements.',
   ].join('\n')
 
@@ -1631,12 +1611,7 @@ function formatUmrahPackageUpdateReply(args: {
   const transportIncluded = quote.transportSectors.length > 0 && !/^not included$/i.test(quote.vehicle)
 
   if (/\b(?:days?|nights?|duration)\b/i.test(text) || /^\s*\d{1,3}\s*(?:days?|nights?)?\s*$/i.test(text)) {
-    const statedDays = text.match(/\b(\d{1,3})\s*days?\b/i)?.[1]
-    if (statedDays) {
-      lines.push(`Done — I’ve updated your trip to ${statedDays} days / ${quote.nights} nights.`)
-    } else {
-      lines.push(`Done — I’ve updated your package duration to ${quote.nights} nights.`)
-    }
+    lines.push(`Done — I’ve updated your package duration to ${quote.nights} nights.`)
     if (makkah || madina) {
       lines.push([
         makkah ? `Makkah: ${makkah.nights} nights` : null,
@@ -1837,24 +1812,6 @@ async function captureAiTravelLead(args: {
  * reacting to a customer message that just landed — so no separate
  * window check is needed.
  */
-function isAssalamGreeting(text: string): boolean {
-  const normalized = text
-    .toLowerCase()
-    .replace(/[^a-z\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-
-  return /\b(?:ass?alamu?|ass?alam|salam)\s*(?:o|u|wa)?\s*(?:alaikum|alaykum|alikum|alekum|alaikoom|alekom)\b/i.test(normalized) ||
-    /\bass?alam(?:u|o)?alaikum\b/i.test(normalized.replace(/\s/g, ''))
-}
-
-function salamReplyForIntent(messages: { role: string; content: string }[]): string {
-  const hasUmrahContext = /\bumrah\b/i.test(conversationText(messages))
-  return hasUmrahContext
-    ? 'Wa Alaikum Assalam! How can I help you with your Umrah package?'
-    : 'Wa Alaikum Assalam! How can I help you today?'
-}
-
 export async function dispatchInboundToAiReply(
   args: DispatchArgs,
 ): Promise<void> {
@@ -1898,27 +1855,6 @@ export async function dispatchInboundToAiReply(
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return
     const latestText = latestUserMessage(messages)
-
-    // Greeting intent always wins. Do not repeat the intake form or route a Salam
-    // through the generic travel model. Reply once with Wa Alaikum Assalam.
-    if (isAssalamGreeting(latestText)) {
-      const { data: claimed, error: claimErr } = await db.rpc(
-        'claim_ai_reply_slot',
-        { conversation_id: conversationId, max_replies: config.autoReplyMaxPerConversation },
-      )
-      if (claimErr || claimed !== true) {
-        if (claimErr) console.error('[ai auto-reply] greeting claim_ai_reply_slot failed:', claimErr)
-        return
-      }
-      await engineSendText({
-        accountId,
-        userId: configOwnerUserId,
-        conversationId,
-        contactId,
-        text: salamReplyForIntent(messages),
-      })
-      return
-    }
 
     const umrahReply = await buildAiUmrahReply({
       db,
