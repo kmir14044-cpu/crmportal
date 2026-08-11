@@ -8,10 +8,6 @@ import { verifyMetaWebhookSignature } from '@/lib/whatsapp/webhook-signature'
 import { runAutomationsForTrigger } from '@/lib/automations/engine'
 import { dispatchInboundToFlows } from '@/lib/flows/engine'
 import { dispatchInboundToAiReply } from '@/lib/ai/auto-reply'
-import {
-  dispatchInboundToUmrahFollowUp,
-  hasEditableUmrahSession,
-} from '@/lib/umrah-planner/follow-up'
 import { dispatchWebhookEvent } from '@/lib/webhooks/deliver'
 import {
   handleTemplateWebhookChange,
@@ -717,54 +713,49 @@ async function processMessage(
   // trigger installed in migration 003).
   await flagBroadcastReplyIfAny(accountId, contactRecord.id)
 
-  // ============================================================
-  // Flow runner dispatch.
-  //
-  // If the runner consumes the message (it either advanced an active
-  // run or started a new one), we suppress the `new_message_received`
-  // + `keyword_match` automation triggers for this inbound. Customer
-  // is navigating the bot menu, not sending a fresh trigger word
-  // that should fork into automations.
-  //
-  // The relationship-level triggers (`new_contact_created`,
-  // `first_inbound_message`) still fire even when consumed — those
-  // are about WHO is messaging, not what they said.
-  //
-  // Awaited (not fire-and-forget) because we need the `consumed`
-  // result before deciding whether to dispatch automations. The
-  // runner has its own try/catch and never throws. Accounts with
-  // no active flows take the runner's early-exit "no_match" path
-  // basically for free (one indexed SELECT for the active run).
-  // ============================================================
   const inboundText = contentText ?? message.text?.body ?? ''
 
-  // Existing Umrah sessions take priority over generic flow triggers.
-  // This keeps collecting, confirmation, quoted, and editing sessions
-  // inside the Umrah assistant instead of restarting the welcome menu.
-  let umrahConsumed = false
-  if (inboundText.trim()) {
-    const hasUmrahSession = await hasEditableUmrahSession({
-      db: supabaseAdmin(),
-      accountId,
-      contactId: contactRecord.id,
-    })
+  // ============================================================
+  // AI Umrah session ownership.
+  //
+  // Once this contact has a persisted Umrah quote/session, AI becomes the
+  // single owner of subsequent FREE-TEXT Umrah package edits/questions.
+  // We intentionally bypass the legacy Flow runner for those text messages,
+  // otherwise keywords such as "Executive hotel" or "add Taif" can start
+  // old hotel/ziyarat button flows and overwrite the AI-managed package.
+  //
+  // Interactive replies are still allowed through Flows so a button/list
+  // that was already sent before this deployment can finish cleanly.
+  // ============================================================
+  let hasAiUmrahSession = false
+  if (!interactiveReplyId && inboundText.trim()) {
+    const { data: umrahSession, error: umrahSessionErr } = await supabaseAdmin()
+      .from('umrah_quote_sessions')
+      .select('id,status')
+      .eq('account_id', accountId)
+      .eq('contact_id', contactRecord.id)
+      .in('status', ['collecting', 'quoted', 'booked'])
+      .maybeSingle()
 
-    if (hasUmrahSession) {
-      const umrahResult = await dispatchInboundToUmrahFollowUp({
-        db: supabaseAdmin(),
-        accountId,
-        userId: configOwnerUserId,
-        contactId: contactRecord.id,
-        conversationId: conversation.id,
-        text: inboundText,
-        interactiveReplyId,
-      })
-      umrahConsumed = umrahResult.consumed
+    if (umrahSessionErr) {
+      console.error('[webhook] Umrah session ownership lookup failed:', umrahSessionErr)
+    } else {
+      hasAiUmrahSession = Boolean(umrahSession?.id)
     }
   }
 
-  const flowResult = umrahConsumed
-    ? { consumed: true, outcome: 'advanced' as const }
+  // ============================================================
+  // Flow runner dispatch.
+  //
+  // Before an Umrah session exists, Flows keep their normal priority
+  // (welcome menu / first package collection can still work).
+  //
+  // After a persisted Umrah session exists, plain text bypasses Flows
+  // and goes directly to AI. This prevents the old Umrah edit flows from
+  // generating hotel / ziyarat buttons during an AI-managed conversation.
+  // ============================================================
+  const flowResult = hasAiUmrahSession
+    ? { consumed: false, outcome: 'ai_umrah_session' as const }
     : await dispatchInboundToFlows({
         accountId,
         userId: configOwnerUserId,
@@ -786,6 +777,7 @@ async function processMessage(
         isFirstInboundMessage,
         lastCustomerMessageAt,
       })
+
   const flowConsumed = flowResult.consumed
   const flowHandedOff = flowResult.outcome === 'handed_off'
 
@@ -825,17 +817,14 @@ async function processMessage(
     }).catch((err) => console.error('[automations] dispatch failed:', err))
   }
 
-  // AI auto-reply. Flows normally win over the LLM, but a flow handoff
-  // means the deterministic path intentionally yielded. In that case,
-  // let AI try the same free-text inbound instead of leaving continuous
-  // customer questions unanswered. `dispatchInboundToAiReply` still owns
-  // its account/conversation gates (AI enabled, no assigned human, cap).
-  if (
-    !umrahConsumed &&
-    (!flowConsumed || flowHandedOff) &&
-    !interactiveReplyId &&
-    inboundText.trim()
-  ) {
+  // AI auto-reply.
+  // - Before an Umrah session exists: normal Flow-first behavior.
+  // - After an Umrah session exists: free text bypassed the Flow runner,
+  //   so AI owns package edits, questions, route changes, hotels, transport,
+  //   ziyarat, PDF requests, etc.
+  // `dispatchInboundToAiReply` still owns its account/conversation gates
+  // (AI enabled, no assigned human, reply cap).
+  if ((!flowConsumed || flowHandedOff) && !interactiveReplyId && inboundText.trim()) {
     await dispatchInboundToAiReply({
       accountId,
       conversationId: conversation.id,
