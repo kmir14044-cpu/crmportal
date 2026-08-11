@@ -126,6 +126,7 @@ type UmrahIntent =
   | 'booking'
   | 'question'
   | 'general'
+  | 'translate'
   | 'handoff'
 
 interface UmrahAiUnderstanding {
@@ -1832,12 +1833,14 @@ async function understandUmrahConversationWithAi(args: {
     'Relative city-night changes must be resolved against the persisted state. Example: if Madinah is currently 4 nights and customer says add one more night in Madinah, return madinahNights 5 and increase total duration to 10 nights; changedFields must include madinahNights and duration.',
     'If the customer says remove one night from Makkah/Madinah, reduce that city by one and reduce total nights by one. Never leave total duration unchanged when a city-night count changes.',
     '',
-    'Intent must be exactly one of: greeting, start_umrah, provide_details, update_package, send_quote, send_pdf, show_itinerary, booking, question, general, handoff.',
+    'Intent must be exactly one of: greeting, start_umrah, provide_details, update_package, send_quote, send_pdf, show_itinerary, booking, question, general, translate, handoff.',
     'send_pdf includes misspellings like send me pd/pfd/pdf file.',
     'show_itinerary means the user asks to see itinerary/details/schedule without changing the package.',
     'booking means they clearly want to book/confirm/proceed.',
     'question means they ask specifically about the CURRENT Umrah quote/package and are not changing it.',
-    'general means ordinary conversation or a non-quote question: company/office/service questions, general travel questions, translation requests, praise, complaints, thanks, small talk, or unrelated help. An active Umrah session does NOT make every message an Umrah question.',
+    'general means ordinary conversation or a non-quote question: company/office/service questions, general travel questions, praise, complaints, thanks, small talk, or unrelated help. An active Umrah session does NOT make every message an Umrah question.',
+    'translate means the customer asks to translate/rewrite the immediately preceding reply, e.g. send this in Urdu, English please, Urdu mein bhejo. Translation NEVER means send_pdf and NEVER changes package state.',
+    'A sentence that reports or reminds you of an earlier command, e.g. I asked you to add 1 night in Madina / maine kaha tha 1 night add karo, is NOT a second update. Treat it as question unless the latest message clearly issues a new change command.',
     'Do not classify "sounds good", "thank you", praise, or acknowledgement as booking unless the customer explicitly asks to book/proceed/confirm.',
     'update_package means they changed one or more package fields.',
     'provide_details means they are supplying missing package fields before a first completed quote.',
@@ -1857,7 +1860,7 @@ async function understandUmrahConversationWithAi(args: {
     const json = extractJsonObject(result.text)
     if (!json) return null
     const intent = String(json.intent ?? '') as UmrahIntent
-    const allowed: UmrahIntent[] = ['greeting','start_umrah','provide_details','update_package','send_quote','send_pdf','show_itinerary','booking','question','general','handoff']
+    const allowed: UmrahIntent[] = ['greeting','start_umrah','provide_details','update_package','send_quote','send_pdf','show_itinerary','booking','question','general','translate','handoff']
     if (!allowed.includes(intent)) return null
     const rawState = json.state && typeof json.state === 'object' && !Array.isArray(json.state)
       ? json.state as Record<string, unknown>
@@ -1982,7 +1985,7 @@ async function generateNaturalRagReply(args: {
     'If the customer says hi/hello/hey or another ordinary greeting, respond with an ordinary friendly greeting instead.',
     'Answer only the latest customer intent. Do not answer an older message just because it appears in recent history.',
     'Do not mention, summarize, or sell the active Umrah package unless the latest customer message actually asks about that package.',
-    'For translation requests such as "I need this in English", translate the immediately preceding relevant assistant answer; do not replace it with the Umrah quotation.',
+    'For translation requests such as "I need this in English", "send this in Urdu", or "Urdu mein bhejo", translate the immediately preceding relevant assistant TEXT answer only. Do not generate/send a PDF, do not recalculate, and do not change package state.',
     'For praise, thanks, complaints, insults, or small talk, respond briefly and naturally without adding package details.',
     'Use the retrieved knowledge for company, destination, office, service, policy, visa/travel guidance, and general travel questions.',
     'Never invent company facts, prices, availability, package inclusions, or booking confirmation.',
@@ -2050,7 +2053,7 @@ async function buildAiUmrahReply(args: {
     message.role === 'assistant' && message.content.includes('customized Umrah package'),
   )
 
-  if (understanding.intent === 'greeting' || understanding.intent === 'general') {
+  if (understanding.intent === 'greeting' || understanding.intent === 'general' || understanding.intent === 'translate') {
     return await generateNaturalRagReply({
       db: args.db,
       accountId: args.accountId,
@@ -2064,6 +2067,37 @@ async function buildAiUmrahReply(args: {
     await upsertAiUmrahLead({ ...args, details })
     return null
   }
+
+  // Read-only intents must NEVER recalculate or rewrite the package. Reuse the
+  // exact last persisted quote so "send PDF", questions, itinerary requests,
+  // translations, etc. cannot make 11 nights fall back to 10 nights.
+  const currentQuote = persistedSession?.quote ?? null
+  if (currentQuote && understanding.intent === 'send_pdf') {
+    return {
+      text: 'Sure — here is your current Umrah quotation PDF.',
+      document: await uploadUmrahQuotePdf({ db: args.db, accountId: args.accountId, quote: currentQuote }) ?? undefined,
+    }
+  }
+  if (currentQuote && understanding.intent === 'show_itinerary') {
+    return [
+      `Here is your ${currentQuote.nights}-night Umrah itinerary:`,
+      '',
+      ...currentQuote.itinerary.flatMap((item) => [item.title, ...item.details.map((detail) => `- ${detail}`), '']),
+      currentQuote.transportSectors.length ? `Transport: ${currentQuote.transportSectors.map((sector) => sector.label).join(', ')}.` : 'Transport: Not included.',
+      `Estimated total: ${currentQuote.priceText}.`,
+    ].join('\n').trim()
+  }
+  if (currentQuote && understanding.intent === 'booking') {
+    return [
+      'Thank you. I’ve noted that you want to proceed with this Umrah package.',
+      `Current estimated total: ${currentQuote.priceText}.`,
+      'Our team will confirm live hotel availability, payment details, and required documents before final booking.',
+    ].join('\n')
+  }
+  if (currentQuote && understanding.intent === 'question') {
+    return await answerUmrahQuestionWithAi({ config: args.config, latestText: args.latestText, quote: currentQuote })
+  }
+
   if (!alreadyAsked && missing.length > 0) {
     await upsertAiUmrahLead({ ...args, details })
     return UMRAH_INTAKE_MESSAGE
