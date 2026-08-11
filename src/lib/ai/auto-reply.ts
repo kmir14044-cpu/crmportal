@@ -1502,6 +1502,212 @@ async function upsertAiUmrahLead(args: {
   })
 }
 
+
+interface PersistedAiUmrahSession {
+  details: ParsedUmrahDetails
+  quote: UmrahQuoteResult | null
+}
+
+function routeSequenceFromStoredRequest(request: Record<string, unknown>): string[] | null {
+  if (Array.isArray(request.route_sequence)) {
+    return normalizeRouteSequenceFromAi(request.route_sequence)
+  }
+  const preset = String(request.route_preset_id ?? '').trim()
+  const byPreset: Record<string, string[]> = {
+    'mk-md': ['Makkah', 'Madinah'],
+    'md-mk': ['Madinah', 'Makkah'],
+    'mk-md-mk': ['Makkah', 'Madinah', 'Makkah'],
+    'md-mk-md': ['Madinah', 'Makkah', 'Madinah'],
+  }
+  return byPreset[preset] ?? null
+}
+
+async function loadPersistedAiUmrahSession(args: {
+  db: AdminClient
+  accountId: string
+  contactId: string
+}): Promise<PersistedAiUmrahSession | null> {
+  const { data, error } = await args.db
+    .from('umrah_quote_sessions')
+    .select('request_payload,result_payload')
+    .eq('account_id', args.accountId)
+    .eq('contact_id', args.contactId)
+    .maybeSingle()
+
+  if (error || !data) {
+    if (error) console.error('[ai auto-reply] persisted Umrah session load failed:', error)
+    return null
+  }
+
+  const request =
+    data.request_payload && typeof data.request_payload === 'object' && !Array.isArray(data.request_payload)
+      ? data.request_payload as Record<string, unknown>
+      : {}
+  const result =
+    data.result_payload && typeof data.result_payload === 'object' && !Array.isArray(data.result_payload)
+      ? data.result_payload as unknown as UmrahQuoteResult
+      : null
+
+  const savedAiState =
+    request.ai_state && typeof request.ai_state === 'object' && !Array.isArray(request.ai_state)
+      ? request.ai_state as Record<string, unknown>
+      : null
+
+  if (savedAiState) {
+    return {
+      details: normalizeResolvedUmrahState(savedAiState),
+      quote: result,
+    }
+  }
+
+  // Backward-compatible restoration for sessions originally created by
+  // the flow/portal path before AI state was stored inside request_payload.
+  const hotelLines = result?.hotelLines ?? []
+  const makkahHotel = hotelLines.find((line) => /makkah/i.test(line.city))?.hotel ?? null
+  const madinahHotel = hotelLines.find((line) => /madina|madinah/i.test(line.city))?.hotel ?? null
+  const transportMode = String(request.transport_mode ?? '').toLowerCase()
+  const selectedSectors = Array.isArray(request.selected_sectors) ? request.selected_sectors : null
+  const includeTransport =
+    transportMode === 'selective' && selectedSectors?.length === 0 ? false : true
+
+  const details = normalizeResolvedUmrahState({
+    budget: request.budget == null ? null : String(request.budget),
+    travelDate: request.start_date,
+    durationValue: request.nights,
+    durationUnit: 'nights',
+    makkahNights: null,
+    madinahNights: null,
+    adults: request.adults,
+    children: request.children,
+    infants: request.infants,
+    hotelCategory: request.hotel_category,
+    rooms: request.rooms,
+    roomType: request.room_type,
+    vehicle: request.vehicle,
+    includeTransport,
+    ziyarat: request.include_ziyarat,
+    selectedZiyarats: request.selected_ziyarats,
+    makkahHotelQuery: makkahHotel,
+    madinahHotelQuery: madinahHotel,
+    hotelPreference: request.hotel_preference,
+    routeSequence: routeSequenceFromStoredRequest(request),
+  })
+
+  return { details, quote: result }
+}
+
+function mergePersistedUmrahDetails(
+  persisted: ParsedUmrahDetails | null,
+  resolved: ParsedUmrahDetails,
+  changedFields: string[],
+): ParsedUmrahDetails {
+  if (!persisted) return resolved
+
+  const merged: ParsedUmrahDetails = {
+    budget: resolved.budget ?? persisted.budget,
+    travelDate: resolved.travelDate ?? persisted.travelDate,
+    days: resolved.days ?? persisted.days,
+    makkahNights: resolved.makkahNights ?? persisted.makkahNights,
+    madinahNights: resolved.madinahNights ?? persisted.madinahNights,
+    adults: resolved.adults ?? persisted.adults,
+    children: resolved.children ?? persisted.children,
+    infants: resolved.infants ?? persisted.infants,
+    elderly: resolved.elderly ?? persisted.elderly,
+    hotelCategory: resolved.hotelCategory ?? persisted.hotelCategory,
+    rooms: resolved.rooms ?? persisted.rooms,
+    roomSharing: resolved.roomSharing ?? persisted.roomSharing,
+    vehicle: resolved.vehicle ?? persisted.vehicle,
+    includeTransport: resolved.includeTransport ?? persisted.includeTransport,
+    ziyarat: resolved.ziyarat ?? persisted.ziyarat,
+    selectedZiyarats: resolved.selectedZiyarats ?? persisted.selectedZiyarats,
+    makkahHotelQuery: resolved.makkahHotelQuery ?? persisted.makkahHotelQuery,
+    madinahHotelQuery: resolved.madinahHotelQuery ?? persisted.madinahHotelQuery,
+    hotelPreference: resolved.hotelPreference ?? persisted.hotelPreference,
+    specialRequirements: resolved.specialRequirements ?? persisted.specialRequirements,
+    routeSequence: resolved.routeSequence ?? persisted.routeSequence,
+  }
+
+  const changed = new Set(changedFields)
+  // A duration or route change should not carry old per-city night overrides
+  // into a newly distributed stay unless the customer explicitly supplied them.
+  if (changed.has('duration') || changed.has('routeSequence')) {
+    if (!changed.has('makkahNights')) merged.makkahNights = null
+    if (!changed.has('madinahNights')) merged.madinahNights = null
+  }
+
+  return merged
+}
+
+async function savePersistedAiUmrahSession(args: {
+  db: AdminClient
+  accountId: string
+  userId: string
+  contactId: string
+  conversationId: string
+  details: ParsedUmrahDetails
+  quote: UmrahQuoteResult
+}): Promise<void> {
+  const selectedHotels = Object.fromEntries(
+    args.quote.hotelLines
+      .map((line, index) => [line.hotelId ? `${line.city}-${index}` : '', line.hotelId] as const)
+      .filter(([key, value]) => Boolean(key && value)),
+  )
+
+  const requestPayload = {
+    // Keep this JSON compatible with the existing Umrah follow-up engine.
+    start_date: args.details.travelDate,
+    route_sequence: args.details.routeSequence?.length
+      ? args.details.routeSequence
+      : args.quote.routeSequence,
+    nights: args.details.days ?? args.quote.nights,
+    adults: args.details.adults ?? 1,
+    children: args.details.children ?? 0,
+    infants: args.details.infants ?? 0,
+    rooms: args.details.rooms ?? args.quote.rooms,
+    room_type: args.details.roomSharing ?? args.quote.roomType,
+    hotel_category: args.details.hotelCategory ?? args.quote.packageCategory,
+    budget: args.details.budget ?? undefined,
+    hotel_preference: args.details.hotelPreference ?? undefined,
+    selected_hotels: selectedHotels,
+    vehicle: args.details.vehicle ?? args.quote.vehicle,
+    transport_mode: args.details.includeTransport === false ? 'selective' : 'full',
+    selected_sectors: args.details.includeTransport === false
+      ? []
+      : args.quote.transportSectors.map((sector) => sector.sector),
+    include_visa: args.quote.visaTotal > 0,
+    include_ziyarat: args.details.ziyarat ?? args.quote.ziyarats.length > 0,
+    selected_ziyarats: args.details.selectedZiyarats ?? args.quote.ziyarats.map((item) => item.id),
+
+    // Exact AI-resolved package state. This is what lets the conversation
+    // resume after the chat context has been trimmed or many hours have passed.
+    ai_state: {
+      ...args.details,
+      routeSequence: args.details.routeSequence ?? args.quote.routeSequence,
+    },
+  }
+
+  const { error } = await args.db
+    .from('umrah_quote_sessions')
+    .upsert(
+      {
+        account_id: args.accountId,
+        user_id: args.userId,
+        contact_id: args.contactId,
+        conversation_id: args.conversationId,
+        request_payload: requestPayload,
+        result_payload: args.quote,
+        status: 'quoted',
+        pending_edit: {},
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'account_id,contact_id' },
+    )
+
+  if (error) {
+    console.error('[ai auto-reply] persisted Umrah session save failed:', error)
+  }
+}
+
 function normalizedVehicleFromAi(value: unknown): string | null {
   const raw = stringValue(value)
   if (!raw) return null
@@ -1579,14 +1785,18 @@ async function understandUmrahConversationWithAi(args: {
   config: AiConfig
   messages: { role: string; content: string }[]
   latestText: string
+  persistedDetails?: ParsedUmrahDetails | null
 }): Promise<UmrahAiUnderstanding | null> {
   const today = new Date().toISOString().slice(0, 10)
   const systemPrompt = [
     'You are the single language-understanding layer for a WhatsApp Umrah sales assistant.',
     'Read the conversation and return ONE JSON object only. Never return markdown.',
     'Your job is language understanding and state resolution, not price calculation.',
-    'Resolve the CURRENT package state from the full conversation, preserving earlier values unless the customer changes them.',
+    'Resolve the CURRENT package state from the conversation AND the persisted package state below, preserving earlier values unless the customer changes them.',
+    'The persisted package state is the source of truth for existing package fields when older chat messages are no longer in context.',
+    `Persisted package state: ${JSON.stringify(args.persistedDetails ?? null)}`,
     'Never invent a value that the customer did not provide or clearly imply.',
+    'If the customer gives a vague date change such as "mid October" without an exact day, do NOT invent a date. Use intent question, preserve the current travelDate, and ask for an exact date.',
     '',
     `Today is ${today}.`,
     'Understand natural English, Urdu written in Roman script, typos, abbreviations, and short replies.',
@@ -1729,22 +1939,35 @@ async function buildAiUmrahReply(args: {
   latestText: string
   messages: { role: string; content: string }[]
 }): Promise<AiReplyPayload | null> {
-  const isUmrah = /\bumrah\b/i.test(conversationText(args.messages))
+  const persistedSession = await loadPersistedAiUmrahSession({
+    db: args.db,
+    accountId: args.accountId,
+    contactId: args.contactId,
+  })
+
+  // A saved quote keeps this an Umrah conversation even when older messages
+  // have fallen out of the AI context window.
+  const isUmrah = Boolean(persistedSession) || /\bumrah\b/i.test(conversationText(args.messages))
   if (!isUmrah) return null
 
   const understanding = await understandUmrahConversationWithAi({
     config: args.config,
     messages: args.messages,
     latestText: args.latestText,
+    persistedDetails: persistedSession?.details ?? null,
   })
   if (!understanding) {
     console.error('[ai auto-reply] unified Umrah understanding returned no usable result')
     return null
   }
 
-  const details = understanding.details
+  const details = mergePersistedUmrahDetails(
+    persistedSession?.details ?? null,
+    understanding.details,
+    understanding.changedFields,
+  )
   const missing = missingUmrahFields(details)
-  const alreadyAsked = args.messages.some((message) =>
+  const alreadyAsked = Boolean(persistedSession) || args.messages.some((message) =>
     message.role === 'assistant' && message.content.includes('customized Umrah package'),
   )
 
@@ -1768,7 +1991,17 @@ async function buildAiUmrahReply(args: {
     const plannerData = await loadUmrahPlannerDataForAccount(args.db, args.accountId)
     const { quote } = buildCurrentUmrahQuote(details, plannerData)
     const budget = budgetAmount(details.budget)
-    const hasPreviousQuote = args.messages.some((message) =>
+
+    await savePersistedAiUmrahSession({
+      db: args.db,
+      accountId: args.accountId,
+      userId: args.userId,
+      contactId: args.contactId,
+      conversationId: args.conversationId,
+      details,
+      quote,
+    })
+    const hasPreviousQuote = Boolean(persistedSession?.quote) || args.messages.some((message) =>
       message.role === 'assistant' && /Tours in Pakistan Umrah quotation/i.test(message.content),
     )
 
@@ -2108,6 +2341,9 @@ export async function dispatchInboundToAiReply(
     // below (this read can race a concurrent inbound).
     if (conv.ai_reply_count >= config.autoReplyMaxPerConversation) return
 
+    // Message context may be trimmed for token efficiency. Umrah package state is
+    // restored separately from umrah_quote_sessions inside buildAiUmrahReply,
+    // so inactivity or context trimming must not restart the intake.
     const messages = await buildConversationContext(db, conversationId)
     if (messages.length === 0) return
     const latestText = latestUserMessage(messages)
