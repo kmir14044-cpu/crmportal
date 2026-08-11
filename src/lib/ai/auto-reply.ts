@@ -85,6 +85,7 @@ interface ParsedUmrahDetails {
   madinahHotelQuery: string | null
   hotelPreference: 'cheapest' | null
   specialRequirements: string | null
+  routeSequence?: string[] | null
 }
 
 interface DispatchArgs {
@@ -929,46 +930,79 @@ function buildCurrentUmrahQuote(
   plannerData: Record<string, unknown>,
   options: { hotelCategory?: string; hotelPreference?: 'cheapest' } = {},
 ): { quote: UmrahQuoteResult; vehicle: string } {
-  const stopNights = details.madinahNights && details.days
-    ? [Math.max(0, details.days - details.madinahNights), details.madinahNights]
-    : details.makkahNights && details.days
-      ? [details.makkahNights, Math.max(0, details.days - details.makkahNights)]
-      : undefined
-  const vehicle = details.specialRequirements?.match(/\b(shared shuttle|car|suv|staria|gmc|hiace|coaster)\b/i)?.[1] ?? 'Car'
-  const roomSetup = inferredRoomSetup(details)
-  const selectedHotels = {
-    ...(findUmrahHotelId(plannerData, 'makkah', details.makkahHotelQuery) ? {
-      'Makkah-0': findUmrahHotelId(plannerData, 'makkah', details.makkahHotelQuery)!,
-    } : {}),
-    ...(findUmrahHotelId(plannerData, 'mad', details.madinahHotelQuery) ? {
-      'Madinah-1': findUmrahHotelId(plannerData, 'mad', details.madinahHotelQuery)!,
-    } : {}),
+  const routeSequence = details.routeSequence?.length
+    ? details.routeSequence
+    : ['Makkah', 'Madinah']
+
+  let stopNights: number[] | undefined
+  if (routeSequence.length === 2 && details.days) {
+    const explicitByCity: Record<string, number | null> = {
+      Makkah: details.makkahNights,
+      Madinah: details.madinahNights,
+    }
+    const firstCity = routeSequence[0]
+    const secondCity = routeSequence[1]
+    const firstExplicit = explicitByCity[firstCity] ?? null
+    const secondExplicit = explicitByCity[secondCity] ?? null
+
+    if (
+      firstExplicit !== null &&
+      secondExplicit !== null &&
+      firstExplicit + secondExplicit === details.days
+    ) {
+      stopNights = [firstExplicit, secondExplicit]
+    } else if (firstExplicit !== null) {
+      stopNights = [firstExplicit, Math.max(0, details.days - firstExplicit)]
+    } else if (secondExplicit !== null) {
+      stopNights = [Math.max(0, details.days - secondExplicit), secondExplicit]
+    }
   }
+
+  const vehicle =
+    details.specialRequirements?.match(/\b(shared shuttle|car|suv|staria|gmc|hiace|coaster)\b/i)?.[1] ??
+    'Car'
+  const roomSetup = inferredRoomSetup(details)
+
+  const selectedHotels: Record<string, string> = {}
+  routeSequence.forEach((city, index) => {
+    if (/makkah/i.test(city) && details.makkahHotelQuery) {
+      const hotelId = findUmrahHotelId(plannerData, 'makkah', details.makkahHotelQuery)
+      if (hotelId) selectedHotels[`${city}-${index}`] = hotelId
+    }
+    if (/madina|madinah/i.test(city) && details.madinahHotelQuery) {
+      const hotelId = findUmrahHotelId(plannerData, 'mad', details.madinahHotelQuery)
+      if (hotelId) selectedHotels[`${city}-${index}`] = hotelId
+    }
+  })
+
   return {
     vehicle: details.vehicle ?? vehicle,
-    quote: quoteUmrah({
-      name: 'WhatsApp lead',
-      phone: '',
-      start_date: details.travelDate!,
-      route_preset_id: 'mk-md',
-      nights: details.days ?? 10,
-      stop_nights: stopNights,
-      adults: details.adults ?? 1,
-      children: details.children ?? 0,
-      infants: details.infants ?? 0,
-      rooms: roomSetup.rooms,
-      room_type: roomSetup.roomType,
-      hotel_category: normalizedUmrahHotelCategory(options.hotelCategory ?? details.hotelCategory),
-      budget: details.budget ?? undefined,
-      hotel_preference: options.hotelPreference ?? details.hotelPreference ?? 'cheapest',
-      selected_hotels: selectedHotels,
-      vehicle: details.vehicle ?? vehicle,
-      transport_mode: details.includeTransport === false ? 'selective' : 'full',
-      selected_sectors: details.includeTransport === false ? [] : undefined,
-      include_visa: true,
-      include_ziyarat: details.ziyarat ?? false,
-      selected_ziyarats: details.selectedZiyarats?.length ? details.selectedZiyarats : undefined,
-    }, plannerData),
+    quote: quoteUmrah(
+      {
+        name: 'WhatsApp lead',
+        phone: '',
+        start_date: details.travelDate!,
+        route_sequence: routeSequence,
+        nights: details.days ?? 10,
+        stop_nights: stopNights,
+        adults: details.adults ?? 1,
+        children: details.children ?? 0,
+        infants: details.infants ?? 0,
+        rooms: roomSetup.rooms,
+        room_type: roomSetup.roomType,
+        hotel_category: normalizedUmrahHotelCategory(options.hotelCategory ?? details.hotelCategory),
+        budget: details.budget ?? undefined,
+        hotel_preference: options.hotelPreference ?? details.hotelPreference ?? 'cheapest',
+        selected_hotels: selectedHotels,
+        vehicle: details.vehicle ?? vehicle,
+        transport_mode: details.includeTransport === false ? 'selective' : 'full',
+        selected_sectors: details.includeTransport === false ? [] : undefined,
+        include_visa: true,
+        include_ziyarat: details.ziyarat ?? false,
+        selected_ziyarats: details.selectedZiyarats?.length ? details.selectedZiyarats : undefined,
+      },
+      plannerData,
+    ),
   }
 }
 
@@ -979,6 +1013,7 @@ function umrahQuoteContext(quote: UmrahQuoteResult): Record<string, unknown> {
     perPerson: Math.ceil(quote.total / Math.max(1, quote.travelers)),
     currency: quote.currency,
     route: quote.route,
+    routeSequence: quote.routeSequence,
     travelDate: quote.startDate,
     nights: quote.nights,
     travelers: quote.travelers,
@@ -1483,6 +1518,21 @@ function normalizedVehicleFromAi(value: unknown): string | null {
   return known[key] ?? raw.replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
 
+function normalizeRouteSequenceFromAi(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null
+  const normalized = value
+    .map((item) => String(item ?? '').trim().toLowerCase())
+    .map((item) => {
+      if (/^(makkah|mecca)$/.test(item)) return 'Makkah'
+      if (/^(madina|madinah|medina)$/.test(item)) return 'Madinah'
+      return null
+    })
+    .filter((item): item is string => Boolean(item))
+
+  if (normalized.length < 2) return null
+  return normalized.slice(0, 3)
+}
+
 function normalizeResolvedUmrahState(raw: Record<string, unknown>): ParsedUmrahDetails {
   const travelDateRaw = stringValue(raw.travelDate ?? raw.travel_date)
   const travelDate = travelDateRaw ? parseDateText(travelDateRaw) : null
@@ -1496,6 +1546,9 @@ function normalizeResolvedUmrahState(raw: Record<string, unknown>): ParsedUmrahD
   const rooms = roomsRaw != null ? Math.max(1, roomsRaw) : (roomType ? 1 : null)
   const hotelCategory = validHotelCategory(stringValue(raw.hotelCategory ?? raw.hotel_category))
   const selectedZiyarats = stringArrayFromAi(raw.selectedZiyarats ?? raw.selected_ziyarats)
+  const routeSequence = normalizeRouteSequenceFromAi(
+    raw.routeSequence ?? raw.route_sequence ?? raw.route ?? raw.citySequence ?? raw.city_sequence,
+  )
 
   return {
     budget: stringValue(raw.budget),
@@ -1518,6 +1571,7 @@ function normalizeResolvedUmrahState(raw: Record<string, unknown>): ParsedUmrahD
     madinahHotelQuery: stringValue(raw.madinahHotelQuery ?? raw.madinaHotelQuery ?? raw.madinah_hotel ?? raw.madina_hotel),
     hotelPreference: /cheapest|cheap|lower|lowest/i.test(stringValue(raw.hotelPreference ?? raw.hotel_preference) ?? '') ? 'cheapest' : null,
     specialRequirements: stringValue(raw.specialRequirements ?? raw.special_requirements),
+    routeSequence,
   }
 }
 
@@ -1544,6 +1598,10 @@ async function understandUmrahConversationWithAi(args: {
     'Transport: phrases like no transport/no vehicle/transport nahi chahiye mean includeTransport false. A vehicle request such as Hiace/SUV/Staria/GMC/Car means includeTransport true and set vehicle.',
     'Hotels: understand requests like hotel voco kardo/change Makkah hotel to Voco. Do not invent a city if the user clearly names one; if they say only a hotel name, preserve the most likely city from current package context.',
     'Ziyarat: understand add/remove and named ziyarats such as Makkah, Madina, Badar, Taif.',
+    'Route: resolve customer city order into routeSequence using only Makkah and Madinah.',
+    'Supported standard route sequences: ["Makkah","Madinah"], ["Madinah","Makkah"], ["Makkah","Madinah","Makkah"], ["Madinah","Makkah","Madinah"].',
+    'Examples: "pehle madina phir makkah" => ["Madinah","Makkah"]; "makkah phir madina phir makkah" => ["Makkah","Madinah","Makkah"].',
+    'A route change is NOT a hotel change. If the latest customer message changes city order, changedFields must include routeSequence.',
     '',
     'Intent must be exactly one of: greeting, start_umrah, provide_details, update_package, send_quote, send_pdf, show_itinerary, booking, question, handoff.',
     'send_pdf includes misspellings like send me pd/pfd/pdf file.',
@@ -1552,10 +1610,10 @@ async function understandUmrahConversationWithAi(args: {
     'question means they ask about the current quote/package and are not changing it.',
     'update_package means they changed one or more package fields.',
     'provide_details means they are supplying missing package fields before a first completed quote.',
-    'changedFields must contain only fields changed by the LATEST customer message, such as travelDate,duration,adults,rooms,roomType,hotelCategory,vehicle,includeTransport,makkahHotelQuery,madinahHotelQuery,budget,ziyarat,selectedZiyarats.',
+    'changedFields must contain only fields changed by the LATEST customer message, such as travelDate,duration,adults,rooms,roomType,hotelCategory,vehicle,includeTransport,makkahHotelQuery,madinahHotelQuery,budget,ziyarat,selectedZiyarats,routeSequence.',
     '',
     'Return this exact shape:',
-    '{"intent":"...","changedFields":[],"question":null,"state":{"budget":null,"travelDate":null,"durationValue":null,"durationUnit":null,"makkahNights":null,"madinahNights":null,"adults":null,"children":null,"infants":null,"elderly":null,"hotelCategory":null,"rooms":null,"roomType":null,"vehicle":null,"includeTransport":null,"ziyarat":null,"selectedZiyarats":null,"makkahHotelQuery":null,"madinahHotelQuery":null,"hotelPreference":null,"specialRequirements":null}}',
+    '{"intent":"...","changedFields":[],"question":null,"state":{"budget":null,"travelDate":null,"durationValue":null,"durationUnit":null,"makkahNights":null,"madinahNights":null,"adults":null,"children":null,"infants":null,"elderly":null,"hotelCategory":null,"rooms":null,"roomType":null,"vehicle":null,"includeTransport":null,"ziyarat":null,"selectedZiyarats":null,"makkahHotelQuery":null,"madinahHotelQuery":null,"hotelPreference":null,"specialRequirements":null,"routeSequence":null}}',
   ].join('\n')
 
   const recent = args.messages.slice(-18).map((message) => ({
@@ -1622,7 +1680,10 @@ function formatUpdateReplyFromChangedFields(args: {
   const madina = quote.hotelLines.find((line) => /madina|madinah/i.test(line.city))
   const lines: string[] = []
 
-  if (fields.has('duration')) {
+  if (fields.has('routeSequence')) {
+    lines.push(`Done — I’ve updated the route to ${quote.route}.`)
+    lines.push('Your hotel order, stay dates, and transport sectors have been recalculated for the new route.')
+  } else if (fields.has('duration')) {
     lines.push(`Done — I’ve updated the trip duration to ${quote.nights} hotel nights.`)
     if (makkah || madina) lines.push([makkah ? `Makkah: ${makkah.nights} nights` : '', madina ? `Madina: ${madina.nights} nights` : ''].filter(Boolean).join(' | '))
   } else if (fields.has('travelDate')) {
