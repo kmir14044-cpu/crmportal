@@ -134,6 +134,10 @@ interface UmrahAiUnderstanding {
   changedFields: string[]
   details: ParsedUmrahDetails
   question: string | null
+  nightDelta: {
+    makkah: number
+    madinah: number
+  } | null
 }
 
 function travelLeadTopic(text: string): string | null {
@@ -1602,6 +1606,37 @@ async function loadPersistedAiUmrahSession(args: {
   return { details, quote: result }
 }
 
+function applyNightDeltaToPersistedState(
+  persisted: ParsedUmrahDetails | null,
+  resolved: ParsedUmrahDetails,
+  delta: { makkah: number; madinah: number } | null,
+): ParsedUmrahDetails {
+  if (!delta || !persisted) return resolved
+
+  const next: ParsedUmrahDetails = { ...resolved }
+
+  const baseMakkah = persisted.makkahNights ?? 0
+  const baseMadinah = persisted.madinahNights ?? 0
+
+  if (delta.makkah !== 0) {
+    next.makkahNights = Math.max(0, baseMakkah + delta.makkah)
+  } else {
+    next.makkahNights = persisted.makkahNights
+  }
+
+  if (delta.madinah !== 0) {
+    next.madinahNights = Math.max(0, baseMadinah + delta.madinah)
+  } else {
+    next.madinahNights = persisted.madinahNights
+  }
+
+  if (next.makkahNights != null && next.madinahNights != null) {
+    next.days = next.makkahNights + next.madinahNights
+  }
+
+  return next
+}
+
 function mergePersistedUmrahDetails(
   persisted: ParsedUmrahDetails | null,
   resolved: ParsedUmrahDetails,
@@ -1837,8 +1872,11 @@ async function understandUmrahConversationWithAi(args: {
     'Supported standard route sequences: ["Makkah","Madinah"], ["Madinah","Makkah"], ["Makkah","Madinah","Makkah"], ["Madinah","Makkah","Madinah"].',
     'Examples: "pehle madina phir makkah" => ["Madinah","Makkah"]; "makkah phir madina phir makkah" => ["Makkah","Madinah","Makkah"].',
     'A route change is NOT a hotel change and is NOT a duration/night change. If the latest customer message only changes city order, changedFields must include routeSequence ONLY (unless the user explicitly changes something else). Preserve existing Makkah and Madinah night counts exactly. Example: saved Makkah 9 + Madinah 5, then "Madina first then Makkah" => routeSequence ["Madinah","Makkah"], makkahNights 9, madinahNights 5, total nights 14.',
-    'Relative city-night changes must be resolved against the persisted state. Example: if Madinah is currently 4 nights and customer says add one more night in Madinah, return madinahNights 5 and increase total duration to 10 nights; changedFields must include madinahNights and duration.',
-    'If the customer says remove one night from Makkah/Madinah, reduce that city by one and reduce total nights by one. Never leave total duration unchanged when a city-night count changes.',
+    'For RELATIVE city-night changes, do NOT do the arithmetic yourself. Return nightDelta instead. Examples: "add 1 night in Makkah" => nightDelta {"makkah":1,"madinah":0}; "increase 2 nights in Madina" => {"makkah":0,"madinah":2}; "remove 1 night from Madina" => {"makkah":0,"madinah":-1}.',
+    'For ABSOLUTE city-night instructions, use state.makkahNights/state.madinahNights instead and nightDelta null. Example: "make Madina 5 nights" => state.madinahNights 5.',
+    'If the customer sends a fragmented update in consecutive messages before the bot replies, use the immediately preceding customer message as context. Example: previous customer message "add 1 night in Makkah", latest "2 in Madina" => interpret the combined pending edit as nightDelta {"makkah":1,"madinah":2}, not as an absolute 2-night stay.',
+    'A reminder/complaint such as "I asked you to add 1 night in Madina" is NOT a new increment; treat it as question/general unless the user clearly issues a fresh change command.',
+    'When nightDelta is non-null, changedFields should include the affected city-night fields and duration.',
     '',
     'Intent must be exactly one of: greeting, start_umrah, provide_details, update_package, send_quote, send_pdf, show_itinerary, booking, question, general, translate, handoff.',
     'send_pdf includes misspellings like send me pd/pfd/pdf file.',
@@ -1851,10 +1889,10 @@ async function understandUmrahConversationWithAi(args: {
     'Do not classify "sounds good", "thank you", praise, or acknowledgement as booking unless the customer explicitly asks to book/proceed/confirm.',
     'update_package means they changed one or more package fields.',
     'provide_details means they are supplying missing package fields before a first completed quote.',
-    'changedFields must contain only fields changed by the LATEST customer message, such as travelDate,duration,adults,rooms,roomType,hotelCategory,vehicle,includeTransport,makkahHotelQuery,madinahHotelQuery,budget,ziyarat,selectedZiyarats,routeSequence.',
+    'changedFields must contain only fields changed by the LATEST customer message, such as travelDate,duration,adults,rooms,roomType,hotelCategory,vehicle,includeTransport,makkahHotelQuery,madinahHotelQuery,budget,ziyarat,selectedZiyarats,routeSequence,makkahNights,madinahNights.',
     '',
     'Return this exact shape:',
-    '{"intent":"...","changedFields":[],"question":null,"state":{"budget":null,"travelDate":null,"durationValue":null,"durationUnit":null,"makkahNights":null,"madinahNights":null,"adults":null,"children":null,"infants":null,"elderly":null,"hotelCategory":null,"rooms":null,"roomType":null,"vehicle":null,"includeTransport":null,"ziyarat":null,"selectedZiyarats":null,"makkahHotelQuery":null,"madinahHotelQuery":null,"hotelPreference":null,"specialRequirements":null,"routeSequence":null}}',
+    '{"intent":"...","changedFields":[],"question":null,"nightDelta":null,"state":{"budget":null,"travelDate":null,"durationValue":null,"durationUnit":null,"makkahNights":null,"madinahNights":null,"adults":null,"children":null,"infants":null,"elderly":null,"hotelCategory":null,"rooms":null,"roomType":null,"vehicle":null,"includeTransport":null,"ziyarat":null,"selectedZiyarats":null,"makkahHotelQuery":null,"madinahHotelQuery":null,"hotelPreference":null,"specialRequirements":null,"routeSequence":null}}',
   ].join('\n')
 
   const recent = args.messages.slice(-18).map((message) => ({
@@ -1875,11 +1913,26 @@ async function understandUmrahConversationWithAi(args: {
     const changedFields = Array.isArray(json.changedFields)
       ? json.changedFields.map(String).filter(Boolean).slice(0, 20)
       : []
+    const rawNightDelta =
+      json.nightDelta && typeof json.nightDelta === 'object' && !Array.isArray(json.nightDelta)
+        ? json.nightDelta as Record<string, unknown>
+        : null
+    const nightDelta = rawNightDelta
+      ? {
+          makkah: Math.trunc(numberValueFromAi(rawNightDelta.makkah) ?? 0),
+          madinah: Math.trunc(numberValueFromAi(rawNightDelta.madinah ?? rawNightDelta.madina) ?? 0),
+        }
+      : null
+
     return {
       intent,
       changedFields,
       question: stringValue(json.question) ?? (intent === 'question' ? args.latestText : null),
       details: normalizeResolvedUmrahState(rawState),
+      nightDelta:
+        nightDelta && (nightDelta.makkah !== 0 || nightDelta.madinah !== 0)
+          ? nightDelta
+          : null,
     }
   } catch (err) {
     console.error('[ai auto-reply] unified Umrah understanding failed:', err)
@@ -2050,9 +2103,15 @@ async function buildAiUmrahReply(args: {
     return null
   }
 
-  const details = mergePersistedUmrahDetails(
+  const deltaAppliedDetails = applyNightDeltaToPersistedState(
     persistedSession?.details ?? null,
     understanding.details,
+    understanding.nightDelta,
+  )
+
+  const details = mergePersistedUmrahDetails(
+    persistedSession?.details ?? null,
+    deltaAppliedDetails,
     understanding.changedFields,
   )
   const missing = missingUmrahFields(details)
@@ -2115,9 +2174,30 @@ async function buildAiUmrahReply(args: {
   }
 
   try {
+    // Do not let an older concurrent inbound mutate the saved package.
+    // If a newer customer message arrived while the AI was understanding this one,
+    // stop before recalculation/session save. The newer job will own the update.
+    if (!(await isStillLatestCustomerMessage({
+      db: args.db,
+      conversationId: args.conversationId,
+      latestText: args.latestText,
+    }))) {
+      console.log('[ai auto-reply] skipped stale Umrah mutation before quote/session save')
+      return null
+    }
+
     const plannerData = await loadUmrahPlannerDataForAccount(args.db, args.accountId)
     const { quote } = buildCurrentUmrahQuote(details, plannerData)
     const budget = budgetAmount(details.budget)
+
+    if (!(await isStillLatestCustomerMessage({
+      db: args.db,
+      conversationId: args.conversationId,
+      latestText: args.latestText,
+    }))) {
+      console.log('[ai auto-reply] skipped stale Umrah session save after quote calculation')
+      return null
+    }
 
     await savePersistedAiUmrahSession({
       db: args.db,
