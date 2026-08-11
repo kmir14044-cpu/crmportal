@@ -716,67 +716,35 @@ async function processMessage(
   const inboundText = contentText ?? message.text?.body ?? ''
 
   // ============================================================
-  // AI Umrah session ownership.
+  // AI-FIRST ROUTING FOR PLAIN TEXT
   //
-  // Once this contact has a persisted Umrah quote/session, AI becomes the
-  // single owner of subsequent FREE-TEXT Umrah package edits/questions.
-  // We intentionally bypass the legacy Flow runner for those text messages,
-  // otherwise keywords such as "Executive hotel" or "add Taif" can start
-  // old hotel/ziyarat button flows and overwrite the AI-managed package.
+  // Plain customer text is owned by AI from the first message onward.
+  // This gives greetings and natural-language requests one consistent path:
+  //   hi / hello / salam / assalamualaikum -> AI
+  //   Umrah request                         -> AI
+  //   package edits/questions              -> AI
   //
-  // Interactive replies are still allowed through Flows so a button/list
-  // that was already sent before this deployment can finish cleanly.
+  // The legacy Flow runner is now used only for INTERACTIVE replies
+  // (button/list taps that were explicitly sent to the customer). This
+  // prevents greeting keywords, hotel changes, ziyarat changes, etc. from
+  // unexpectedly launching an old Flow menu.
   // ============================================================
-  let hasAiUmrahSession = false
-  if (!interactiveReplyId && inboundText.trim()) {
-    const { data: umrahSession, error: umrahSessionErr } = await supabaseAdmin()
-      .from('umrah_quote_sessions')
-      .select('id,status')
-      .eq('account_id', accountId)
-      .eq('contact_id', contactRecord.id)
-      .in('status', ['collecting', 'quoted', 'booked'])
-      .maybeSingle()
-
-    if (umrahSessionErr) {
-      console.error('[webhook] Umrah session ownership lookup failed:', umrahSessionErr)
-    } else {
-      hasAiUmrahSession = Boolean(umrahSession?.id)
-    }
-  }
-
-  // ============================================================
-  // Flow runner dispatch.
-  //
-  // Before an Umrah session exists, Flows keep their normal priority
-  // (welcome menu / first package collection can still work).
-  //
-  // After a persisted Umrah session exists, plain text bypasses Flows
-  // and goes directly to AI. This prevents the old Umrah edit flows from
-  // generating hotel / ziyarat buttons during an AI-managed conversation.
-  // ============================================================
-  const flowResult = hasAiUmrahSession
-    ? { consumed: false, outcome: 'ai_umrah_session' as const }
-    : await dispatchInboundToFlows({
+  const flowResult = interactiveReplyId
+    ? await dispatchInboundToFlows({
         accountId,
         userId: configOwnerUserId,
         contactId: contactRecord.id,
         conversationId: conversation.id,
-        message:
-          interactiveReplyId
-            ? {
-                kind: 'interactive_reply',
-                reply_id: interactiveReplyId,
-                reply_title: contentText ?? '',
-                meta_message_id: message.id,
-              }
-            : {
-                kind: 'text',
-                text: inboundText,
-                meta_message_id: message.id,
-              },
+        message: {
+          kind: 'interactive_reply',
+          reply_id: interactiveReplyId,
+          reply_title: contentText ?? '',
+          meta_message_id: message.id,
+        },
         isFirstInboundMessage,
         lastCustomerMessageAt,
       })
+    : { consumed: false, outcome: 'ai_first_text' as const }
 
   const flowConsumed = flowResult.consumed
   const flowHandedOff = flowResult.outcome === 'handed_off'
@@ -818,12 +786,8 @@ async function processMessage(
   }
 
   // AI auto-reply.
-  // - Before an Umrah session exists: normal Flow-first behavior.
-  // - After an Umrah session exists: free text bypassed the Flow runner,
-  //   so AI owns package edits, questions, route changes, hotels, transport,
-  //   ziyarat, PDF requests, etc.
-  // `dispatchInboundToAiReply` still owns its account/conversation gates
-  // (AI enabled, no assigned human, reply cap).
+  // All non-interactive plain text is AI-first. Interactive replies remain
+  // owned by the Flow runner so already-sent buttons/lists can still work.
   if ((!flowConsumed || flowHandedOff) && !interactiveReplyId && inboundText.trim()) {
     await dispatchInboundToAiReply({
       accountId,
