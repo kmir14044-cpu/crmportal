@@ -1929,6 +1929,61 @@ function formatUpdateReplyFromChangedFields(args: {
   return lines.join('\n')
 }
 
+
+async function generateNaturalRagReply(args: {
+  db: AdminClient
+  accountId: string
+  config: AiConfig
+  messages: { role: string; content: string }[]
+  latestText: string
+  activeUmrahState?: ParsedUmrahDetails | null
+}): Promise<string | null> {
+  const knowledge = await retrieveKnowledge(
+    args.db,
+    args.accountId,
+    args.config,
+    args.latestText,
+  )
+
+  const basePrompt = buildSystemPrompt({
+    userPrompt: args.config.systemPrompt,
+    mode: 'auto_reply',
+    knowledge,
+  })
+
+  const systemPrompt = [
+    basePrompt,
+    '',
+    'CONVERSATION BEHAVIOUR',
+    'Understand the latest customer message semantically. Do not rely on keyword or regex-style greeting rules.',
+    'Reply naturally in the same general language/style as the customer.',
+    'If the customer gives an Islamic greeting, respond with the culturally appropriate return greeting.',
+    'If the customer says hi/hello/hey or another ordinary greeting, respond with an ordinary friendly greeting instead.',
+    'Answer only the current intent. Do not unnecessarily repeat an Umrah quotation.',
+    'Use the retrieved knowledge for company, destination, office, service, policy, and general travel questions.',
+    'Never invent company facts, prices, availability, package inclusions, or booking confirmation.',
+    args.activeUmrahState
+      ? `An active Umrah package exists. Current saved package state: ${JSON.stringify(args.activeUmrahState)}`
+      : 'No active Umrah package state is supplied.',
+  ].join('\n')
+
+  try {
+    const result = await generateReply({
+      config: args.config,
+      systemPrompt,
+      messages: args.messages.slice(-18).map((message) => ({
+        role: message.role as 'user' | 'assistant',
+        content: message.content,
+      })),
+    })
+    if (result.handoff) return null
+    return result.text?.trim() || null
+  } catch (err) {
+    console.error('[ai auto-reply] natural RAG reply failed:', err)
+    return null
+  }
+}
+
 async function buildAiUmrahReply(args: {
   db: AdminClient
   accountId: string
@@ -1972,7 +2027,14 @@ async function buildAiUmrahReply(args: {
   )
 
   if (understanding.intent === 'greeting') {
-    return 'Wa Alaikum Assalam! How can I help you with your Umrah package?'
+    return await generateNaturalRagReply({
+      db: args.db,
+      accountId: args.accountId,
+      config: args.config,
+      messages: args.messages,
+      latestText: args.latestText,
+      activeUmrahState: details,
+    })
   }
   if (understanding.intent === 'handoff') {
     await upsertAiUmrahLead({ ...args, details })
@@ -2285,22 +2347,6 @@ async function captureAiTravelLead(args: {
  * reacting to a customer message that just landed — so no separate
  * window check is needed.
  */
-function isAssalamGreeting(text: string): boolean {
-  const compact = text.toLowerCase().replace(/[^a-z]/g, '')
-  const normalized = text.toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim()
-
-  return /^(?:aoa|asalam|assalam|assalamu?alaikum|assalamualaikum|salamualaikum|salamalaykum)$/.test(compact) ||
-    /\b(?:ass?alamu?|ass?alam|salam|a\s*salam)\s*(?:o|u|wa)?\s*(?:alaikum|alaykum|alikum|alekum|alaikoom|alekom)\b/i.test(normalized) ||
-    /^a\s*salam$/i.test(normalized)
-}
-
-function salamReplyForIntent(messages: { role: string; content: string }[]): string {
-  const hasUmrahContext = /\bumrah\b/i.test(conversationText(messages))
-  return hasUmrahContext
-    ? 'Wa Alaikum Assalam! How can I help you with your Umrah package?'
-    : 'Wa Alaikum Assalam! How can I help you today?'
-}
-
 export async function dispatchInboundToAiReply(
   args: DispatchArgs,
 ): Promise<void> {
@@ -2348,26 +2394,8 @@ export async function dispatchInboundToAiReply(
     if (messages.length === 0) return
     const latestText = latestUserMessage(messages)
 
-    // Greeting intent always wins. Do not repeat the intake form or route a Salam
-    // through the generic travel model. Reply once with Wa Alaikum Assalam.
-    if (isAssalamGreeting(latestText)) {
-      const { data: claimed, error: claimErr } = await db.rpc(
-        'claim_ai_reply_slot',
-        { conversation_id: conversationId, max_replies: config.autoReplyMaxPerConversation },
-      )
-      if (claimErr || claimed !== true) {
-        if (claimErr) console.error('[ai auto-reply] greeting claim_ai_reply_slot failed:', claimErr)
-        return
-      }
-      await engineSendText({
-        accountId,
-        userId: configOwnerUserId,
-        conversationId,
-        contactId,
-        text: salamReplyForIntent(messages),
-      })
-      return
-    }
+    // All plain-text language understanding, including greetings, is AI/RAG-driven.
+    // No regex/keyword greeting interception is performed here.
 
     const umrahReply = await buildAiUmrahReply({
       db,
