@@ -1527,7 +1527,7 @@ function normalizeRouteSequenceFromAi(value: unknown): string[] | null {
       if (/^(madina|madinah|medina)$/.test(item)) return 'Madinah'
       return null
     })
-    .filter((item): item is string => Boolean(item))
+    .filter((item): item is 'Makkah' | 'Madinah' => item !== null)
 
   if (normalized.length < 2) return null
   return normalized.slice(0, 3)
