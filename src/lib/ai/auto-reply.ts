@@ -177,33 +177,53 @@ function conversationText(messages: { role: string; content: string }[]): string
 }
 
 function parseDateText(text: string): string | null {
-  const iso = text.match(/\b(20\d{2}-\d{1,2}-\d{1,2})\b/)
-  if (iso) {
-    const [year, month, day] = iso[1].split('-').map(Number)
+  const raw = text.toLowerCase().replace(/(\d)(st|nd|rd|th)\b/g, '$1').trim()
+
+  // yyyy-mm-dd / yyyy/mm/dd
+  const iso = raw.match(/\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b/)
+  if (iso) return validIsoDate(Number(iso[1]), Number(iso[2]), Number(iso[3]))
+
+  // dd-mm-yyyy / dd/mm/yyyy and short-year forms such as 1-12-26.
+  const numeric = raw.match(/\b(\d{1,2})[-/](\d{1,2})[-/](\d{2}|20\d{2})\b/)
+  if (numeric) {
+    const shortYear = Number(numeric[3])
+    const year = shortYear < 100 ? 2000 + shortYear : shortYear
+    return validIsoDate(year, Number(numeric[2]), Number(numeric[1]))
+  }
+
+  const months: Record<string, number> = {
+    jan: 1, january: 1,
+    feb: 2, february: 2,
+    mar: 3, march: 3,
+    apr: 4, april: 4,
+    may: 5,
+    jun: 6, june: 6,
+    jul: 7, july: 7,
+    aug: 8, august: 8,
+    sep: 9, sept: 9, september: 9,
+    oct: 10, october: 10,
+    nov: 11, november: 11,
+    dec: 12, december: 12,
+  }
+
+  // 20 October 2026 / 20 Oct 2026
+  const natural = raw.match(/\b(\d{1,2})\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+(20\d{2}))?\b/i)
+  if (natural) {
+    const day = Number(natural[1])
+    const month = months[natural[2].toLowerCase()]
+    if (!month) return null
+    if (natural[3]) return validIsoDate(Number(natural[3]), month, day)
+
+    // Missing year: use the next occurrence of that calendar date.
+    const now = new Date()
+    let year = now.getFullYear()
+    const candidate = validIsoDate(year, month, day)
+    if (!candidate) return null
+    if (isPastDate(candidate)) year += 1
     return validIsoDate(year, month, day)
   }
-  const natural = text.match(
-    /\b(\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+20\d{2})\b/i,
-  )
-  if (!natural) return null
-  const match = natural[1].match(/^(\d{1,2})\s+([a-z]+)\s+(20\d{2})$/i)
-  if (!match) return natural[1]
-  const months: Record<string, string> = {
-    jan: '01', january: '01',
-    feb: '02', february: '02',
-    mar: '03', march: '03',
-    apr: '04', april: '04',
-    may: '05',
-    jun: '06', june: '06',
-    jul: '07', july: '07',
-    aug: '08', august: '08',
-    sep: '09', september: '09',
-    oct: '10', october: '10',
-    nov: '11', november: '11',
-    dec: '12', december: '12',
-  }
-  const month = months[match[2].toLowerCase()]
-  return month ? validIsoDate(Number(match[3]), Number(month), Number(match[1])) : null
+
+  return null
 }
 
 function validIsoDate(year: number, month: number, day: number): string | null {
@@ -238,7 +258,7 @@ function latestValidDate(messages: { role: string; content: string }[], fallback
 }
 
 function hasDateLikeText(text: string): boolean {
-  return /\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}\s+[a-z]{3,}\s+20\d{2})\b/i.test(text)
+  return /\b(20\d{2}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/](?:\d{2}|20\d{2})|\d{1,2}(?:st|nd|rd|th)?\s+[a-z]{3,}(?:\s+20\d{2})?)\b/i.test(text)
 }
 
 function parseBoolPreference(value: string): boolean | null {
@@ -655,8 +675,10 @@ function mergeUmrahDetails(base: ParsedUmrahDetails, ai: Partial<ParsedUmrahDeta
     infants: ai.infants ?? base.infants,
     elderly: ai.elderly ?? base.elderly,
     hotelCategory: ai.hotelCategory ?? base.hotelCategory,
-    rooms: ai.rooms ?? base.rooms,
-    roomSharing: ai.roomSharing ?? base.roomSharing,
+    // Room counts are deterministic. A date like '12 September' must never become 12 rooms.
+    // If the customer gave a room type (e.g. Double) without a count, inferredRoomSetup defaults to 1 room.
+    rooms: base.rooms ?? (base.roomSharing ? null : ai.rooms ?? null),
+    roomSharing: base.roomSharing ?? ai.roomSharing ?? null,
     // Transport changes are parsed deterministically from the latest user messages.
     // Prefer them over the AI extraction so old transport preferences cannot override a new 'no transport' / 'Hiace' command.
     vehicle: base.vehicle ?? ai.vehicle ?? null,
@@ -845,6 +867,10 @@ function isUmrahPackageUpdate(text: string): boolean {
 
 function isInformationalQuestion(text: string): boolean {
   return /\?/.test(text) || /^(what|which|tell me|can you|do you|is there|are there|how|why)\b/i.test(text.trim())
+}
+
+function wantsUmrahPdf(text: string): boolean {
+  return /\b(?:send|share|give|need|want|download|show)?\s*(?:me\s*)?(?:the\s*)?(?:pdf|pd|quotation\s*(?:pdf|file)|quote\s*(?:pdf|file))\b/i.test(text.trim())
 }
 
 function inferredRoomSetup(details: ParsedUmrahDetails): { rooms: number; roomType: string } {
@@ -1461,6 +1487,18 @@ async function buildAiUmrahReply(args: {
   try {
     const plannerData = await loadUmrahPlannerDataForAccount(args.db, args.accountId)
     const { quote, vehicle: currentVehicle } = buildCurrentUmrahQuote(details, plannerData)
+    const pdfRequested = wantsUmrahPdf(args.latestText)
+    const explicitBookingIntent = /\b(book it|confirm|proceed|go ahead|reserve|final|great book)\b/i.test(args.latestText)
+    const deterministicPackageUpdate = isUmrahPackageUpdate(args.latestText) && !isInformationalQuestion(args.latestText) && !explicitBookingIntent && !pdfRequested
+
+    if (pdfRequested) {
+      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+      return {
+        text: 'Sure — here is your current Umrah quotation PDF.',
+        document: await uploadUmrahQuotePdf({ db: args.db, accountId: args.accountId, quote }) ?? undefined,
+      }
+    }
+
     const aiDecision = await decideAiUmrahAction({
       db: args.db,
       accountId: args.accountId,
@@ -1471,12 +1509,12 @@ async function buildAiUmrahReply(args: {
       quote,
     })
 
-    if (aiDecision?.action === 'handoff') {
+    if (aiDecision?.action === 'handoff' && !deterministicPackageUpdate) {
       await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
       return null
     }
 
-    if (aiDecision?.action === 'booking_follow_up') {
+    if (aiDecision?.action === 'booking_follow_up' && !deterministicPackageUpdate) {
       await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
       return aiDecision.answer || [
         'Great, I have marked this Umrah package for booking follow-up.',
@@ -1485,12 +1523,12 @@ async function buildAiUmrahReply(args: {
       ].join('\n')
     }
 
-    if (aiDecision?.action === 'answer_question' && aiDecision.answer) {
+    if (aiDecision?.action === 'answer_question' && aiDecision.answer && !deterministicPackageUpdate) {
       await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
       return aiDecision.answer
     }
 
-    if (/\b(book it|confirm|proceed|go ahead|reserve|final|great book)\b/i.test(args.latestText)) {
+    if (explicitBookingIntent) {
       await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
       return [
         'Great, I have marked this Umrah package for booking follow-up.',
@@ -1838,14 +1876,12 @@ async function captureAiTravelLead(args: {
  * window check is needed.
  */
 function isAssalamGreeting(text: string): boolean {
-  const normalized = text
-    .toLowerCase()
-    .replace(/[^a-z\s]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
+  const compact = text.toLowerCase().replace(/[^a-z]/g, '')
+  const normalized = text.toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ').trim()
 
-  return /\b(?:ass?alamu?|ass?alam|salam)\s*(?:o|u|wa)?\s*(?:alaikum|alaykum|alikum|alekum|alaikoom|alekom)\b/i.test(normalized) ||
-    /\bass?alam(?:u|o)?alaikum\b/i.test(normalized.replace(/\s/g, ''))
+  return /^(?:aoa|asalam|assalam|assalamu?alaikum|assalamualaikum|salamualaikum|salamalaykum)$/.test(compact) ||
+    /\b(?:ass?alamu?|ass?alam|salam|a\s*salam)\s*(?:o|u|wa)?\s*(?:alaikum|alaykum|alikum|alekum|alaikoom|alekom)\b/i.test(normalized) ||
+    /^a\s*salam$/i.test(normalized)
 }
 
 function salamReplyForIntent(messages: { role: string; content: string }[]): string {
