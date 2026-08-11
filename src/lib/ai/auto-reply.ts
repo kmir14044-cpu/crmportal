@@ -947,12 +947,11 @@ function buildCurrentUmrahQuote(
     const firstExplicit = explicitByCity[firstCity] ?? null
     const secondExplicit = explicitByCity[secondCity] ?? null
 
-    if (
-      firstExplicit !== null &&
-      secondExplicit !== null &&
-      firstExplicit + secondExplicit === details.days
-    ) {
+    if (firstExplicit !== null && secondExplicit !== null) {
+      // City-specific nights are more precise than a previously cached total.
+      // Preserve them exactly, including after route reversal.
       stopNights = [firstExplicit, secondExplicit]
+      details.days = firstExplicit + secondExplicit
     } else if (firstExplicit !== null) {
       stopNights = [firstExplicit, Math.max(0, details.days - firstExplicit)]
     } else if (secondExplicit !== null) {
@@ -1635,12 +1634,20 @@ function mergePersistedUmrahDetails(
   }
 
   const changed = new Set(changedFields)
-  // A duration or route change should not carry old per-city night overrides
-  // into a newly distributed stay unless the customer explicitly supplied them.
-  if (changed.has('duration') || changed.has('routeSequence')) {
-    if (!changed.has('makkahNights')) merged.makkahNights = null
-    if (!changed.has('madinahNights')) merged.madinahNights = null
+
+  // IMPORTANT: changing route order must NEVER change the customer's city-night split.
+  // Example: Makkah 9 nights + Madinah 5 nights remains exactly 9 + 5 when route changes
+  // from Makkah -> Madinah to Madinah -> Makkah. Only the sequence changes.
+  //
+  // If the customer changes TOTAL duration without supplying city-specific nights,
+  // old city overrides can be cleared so quote.ts can redistribute the new total.
+  if (changed.has('duration') && !changed.has('makkahNights') && !changed.has('madinahNights')) {
+    merged.makkahNights = null
+    merged.madinahNights = null
   }
+
+  // Route-only change: preserve saved city-specific nights exactly.
+  // No reset/rebalance happens here.
 
   // City-night edits are business-state changes, not just wording changes.
   // Once both city counts are known, total hotel nights must equal their sum.
@@ -1829,7 +1836,7 @@ async function understandUmrahConversationWithAi(args: {
     'Route: resolve customer city order into routeSequence using only Makkah and Madinah.',
     'Supported standard route sequences: ["Makkah","Madinah"], ["Madinah","Makkah"], ["Makkah","Madinah","Makkah"], ["Madinah","Makkah","Madinah"].',
     'Examples: "pehle madina phir makkah" => ["Madinah","Makkah"]; "makkah phir madina phir makkah" => ["Makkah","Madinah","Makkah"].',
-    'A route change is NOT a hotel change. If the latest customer message changes city order, changedFields must include routeSequence.',
+    'A route change is NOT a hotel change and is NOT a duration/night change. If the latest customer message only changes city order, changedFields must include routeSequence ONLY (unless the user explicitly changes something else). Preserve existing Makkah and Madinah night counts exactly. Example: saved Makkah 9 + Madinah 5, then "Madina first then Makkah" => routeSequence ["Madinah","Makkah"], makkahNights 9, madinahNights 5, total nights 14.',
     'Relative city-night changes must be resolved against the persisted state. Example: if Madinah is currently 4 nights and customer says add one more night in Madinah, return madinahNights 5 and increase total duration to 10 nights; changedFields must include madinahNights and duration.',
     'If the customer says remove one night from Makkah/Madinah, reduce that city by one and reduce total nights by one. Never leave total duration unchanged when a city-night count changes.',
     '',
