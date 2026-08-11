@@ -113,6 +113,26 @@ interface UmrahAiDecision {
   answer: string | null
 }
 
+
+type UmrahIntent =
+  | 'greeting'
+  | 'start_umrah'
+  | 'provide_details'
+  | 'update_package'
+  | 'send_quote'
+  | 'send_pdf'
+  | 'show_itinerary'
+  | 'booking'
+  | 'question'
+  | 'handoff'
+
+interface UmrahAiUnderstanding {
+  intent: UmrahIntent
+  changedFields: string[]
+  details: ParsedUmrahDetails
+  question: string | null
+}
+
 function travelLeadTopic(text: string): string | null {
   const normalized = text.trim().toLowerCase()
   if (!normalized) return null
@@ -457,9 +477,25 @@ function latestHotelQueryFromMessages(messages: { role: string; content: string 
 
 function roomCountFromText(value: string | undefined | null): number | null {
   if (!value) return null
-  if (/^\s*\d{1,2}\s*$/.test(value)) return firstNumber(value)
-  if (!/\b(rooms?|room|single|double|triple|quad|sharing)\b/i.test(value)) return null
-  return firstNumber(value) ?? (/single|double|triple|quad/i.test(value) ? 1 : null)
+  const text = value.trim()
+
+  // A bare number is only treated as a room count when the current answer itself
+  // is just that number (for example after the bot explicitly asked for rooms).
+  if (/^\d{1,2}$/.test(text)) return Number.parseInt(text, 10)
+
+  // Only accept a number when it is directly attached to room wording.
+  // This prevents dates such as "12 September" from becoming 12 rooms merely
+  // because another line in the same message contains "Double".
+  const explicitRoomCount =
+    text.match(/\b(?:rooms?|room)\s*[:x-]?\s*(\d{1,2})\b/i)?.[1] ??
+    text.match(/\b(\d{1,2})\s*(?:x\s*)?(?:rooms?|room)\b/i)?.[1] ??
+    text.match(/\b(\d{1,2})\s*(?:x\s*)?(?:single|double|triple|quad)\s*(?:rooms?|room)?\b/i)?.[1]
+
+  if (explicitRoomCount) return Number.parseInt(explicitRoomCount, 10)
+
+  // A room type without a count means one room, e.g. "Double" or "1 double room".
+  if (/\b(single|double|triple|quad)\b/i.test(text)) return 1
+  return null
 }
 
 function likelyUsefulUmrahAnswer(text: string): boolean {
@@ -1431,6 +1467,197 @@ async function upsertAiUmrahLead(args: {
   })
 }
 
+function normalizedVehicleFromAi(value: unknown): string | null {
+  const raw = stringValue(value)
+  if (!raw) return null
+  const key = raw.trim().toLowerCase()
+  const known: Record<string, string> = {
+    suv: 'SUV',
+    gmc: 'GMC',
+    hiace: 'Hiace',
+    staria: 'Staria',
+    coaster: 'Coaster',
+    car: 'Car',
+    'shared shuttle': 'Shared Shuttle',
+  }
+  return known[key] ?? raw.replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function normalizeResolvedUmrahState(raw: Record<string, unknown>): ParsedUmrahDetails {
+  const travelDateRaw = stringValue(raw.travelDate ?? raw.travel_date)
+  const travelDate = travelDateRaw ? parseDateText(travelDateRaw) : null
+  const durationValue = numberValueFromAi(raw.durationValue ?? raw.duration_value ?? raw.duration ?? raw.days ?? raw.nights)
+  const durationUnit = (stringValue(raw.durationUnit ?? raw.duration_unit) ?? '').toLowerCase()
+  const nights = durationValue == null
+    ? null
+    : Math.max(1, durationUnit.startsWith('day') ? durationValue - 1 : durationValue)
+  const roomType = stringValue(raw.roomType ?? raw.room_type ?? raw.roomSharing ?? raw.room_sharing)
+  const roomsRaw = numberValueFromAi(raw.rooms)
+  const rooms = roomsRaw != null ? Math.max(1, roomsRaw) : (roomType ? 1 : null)
+  const hotelCategory = validHotelCategory(stringValue(raw.hotelCategory ?? raw.hotel_category))
+  const selectedZiyarats = stringArrayFromAi(raw.selectedZiyarats ?? raw.selected_ziyarats)
+
+  return {
+    budget: stringValue(raw.budget),
+    travelDate: travelDate && !isPastDate(travelDate) ? travelDate : null,
+    days: nights,
+    makkahNights: numberValueFromAi(raw.makkahNights ?? raw.makkah_nights),
+    madinahNights: numberValueFromAi(raw.madinahNights ?? raw.madinaNights ?? raw.madinah_nights ?? raw.madina_nights),
+    adults: numberValueFromAi(raw.adults),
+    children: numberValueFromAi(raw.children ?? raw.kids),
+    infants: numberValueFromAi(raw.infants),
+    elderly: stringValue(raw.elderly),
+    hotelCategory,
+    rooms,
+    roomSharing: roomType,
+    vehicle: normalizedVehicleFromAi(raw.vehicle ?? raw.transport),
+    includeTransport: booleanValueFromAi(raw.includeTransport ?? raw.include_transport ?? raw.transportIncluded ?? raw.transport_included),
+    ziyarat: booleanValueFromAi(raw.ziyarat ?? raw.includeZiyarat ?? raw.include_ziyarat),
+    selectedZiyarats,
+    makkahHotelQuery: stringValue(raw.makkahHotelQuery ?? raw.makkah_hotel ?? raw.makkahHotel),
+    madinahHotelQuery: stringValue(raw.madinahHotelQuery ?? raw.madinaHotelQuery ?? raw.madinah_hotel ?? raw.madina_hotel),
+    hotelPreference: /cheapest|cheap|lower|lowest/i.test(stringValue(raw.hotelPreference ?? raw.hotel_preference) ?? '') ? 'cheapest' : null,
+    specialRequirements: stringValue(raw.specialRequirements ?? raw.special_requirements),
+  }
+}
+
+async function understandUmrahConversationWithAi(args: {
+  config: AiConfig
+  messages: { role: string; content: string }[]
+  latestText: string
+}): Promise<UmrahAiUnderstanding | null> {
+  const today = new Date().toISOString().slice(0, 10)
+  const systemPrompt = [
+    'You are the single language-understanding layer for a WhatsApp Umrah sales assistant.',
+    'Read the conversation and return ONE JSON object only. Never return markdown.',
+    'Your job is language understanding and state resolution, not price calculation.',
+    'Resolve the CURRENT package state from the full conversation, preserving earlier values unless the customer changes them.',
+    'Never invent a value that the customer did not provide or clearly imply.',
+    '',
+    `Today is ${today}.`,
+    'Understand natural English, Urdu written in Roman script, typos, abbreviations, and short replies.',
+    'Dates: normalize to YYYY-MM-DD. Accept formats like 1-12-26, 12/09/2026, 12 Sept 2026, 20th October 2026. If only day + month is supplied, choose the next future occurrence.',
+    'IMPORTANT: numbers inside dates or budgets are NEVER room counts or traveler counts.',
+    'Duration: return durationValue and durationUnit exactly as meant by the customer. If they say 15 days => durationValue 15, durationUnit days. If 15 nights => durationValue 15, durationUnit nights. Do NOT subtract a night yourself; code does that.',
+    'Rooms: only set rooms when the customer explicitly gives a room count. A room type by itself, e.g. Double, means roomType Double and rooms 1. Never take 12 from 12 September as 12 rooms.',
+    'Travelers: couple means 2 adults. Do not infer traveler count merely from Double/Triple/Quad room type.',
+    'Transport: phrases like no transport/no vehicle/transport nahi chahiye mean includeTransport false. A vehicle request such as Hiace/SUV/Staria/GMC/Car means includeTransport true and set vehicle.',
+    'Hotels: understand requests like hotel voco kardo/change Makkah hotel to Voco. Do not invent a city if the user clearly names one; if they say only a hotel name, preserve the most likely city from current package context.',
+    'Ziyarat: understand add/remove and named ziyarats such as Makkah, Madina, Badar, Taif.',
+    '',
+    'Intent must be exactly one of: greeting, start_umrah, provide_details, update_package, send_quote, send_pdf, show_itinerary, booking, question, handoff.',
+    'send_pdf includes misspellings like send me pd/pfd/pdf file.',
+    'show_itinerary means the user asks to see itinerary/details/schedule without changing the package.',
+    'booking means they clearly want to book/confirm/proceed.',
+    'question means they ask about the current quote/package and are not changing it.',
+    'update_package means they changed one or more package fields.',
+    'provide_details means they are supplying missing package fields before a first completed quote.',
+    'changedFields must contain only fields changed by the LATEST customer message, such as travelDate,duration,adults,rooms,roomType,hotelCategory,vehicle,includeTransport,makkahHotelQuery,madinahHotelQuery,budget,ziyarat,selectedZiyarats.',
+    '',
+    'Return this exact shape:',
+    '{"intent":"...","changedFields":[],"question":null,"state":{"budget":null,"travelDate":null,"durationValue":null,"durationUnit":null,"makkahNights":null,"madinahNights":null,"adults":null,"children":null,"infants":null,"elderly":null,"hotelCategory":null,"rooms":null,"roomType":null,"vehicle":null,"includeTransport":null,"ziyarat":null,"selectedZiyarats":null,"makkahHotelQuery":null,"madinahHotelQuery":null,"hotelPreference":null,"specialRequirements":null}}',
+  ].join('\n')
+
+  const recent = args.messages.slice(-18).map((message) => ({
+    role: message.role as 'user' | 'assistant',
+    content: message.content,
+  }))
+
+  try {
+    const result = await generateReply({ config: args.config, systemPrompt, messages: recent })
+    const json = extractJsonObject(result.text)
+    if (!json) return null
+    const intent = String(json.intent ?? '') as UmrahIntent
+    const allowed: UmrahIntent[] = ['greeting','start_umrah','provide_details','update_package','send_quote','send_pdf','show_itinerary','booking','question','handoff']
+    if (!allowed.includes(intent)) return null
+    const rawState = json.state && typeof json.state === 'object' && !Array.isArray(json.state)
+      ? json.state as Record<string, unknown>
+      : {}
+    const changedFields = Array.isArray(json.changedFields)
+      ? json.changedFields.map(String).filter(Boolean).slice(0, 20)
+      : []
+    return {
+      intent,
+      changedFields,
+      question: stringValue(json.question) ?? (intent === 'question' ? args.latestText : null),
+      details: normalizeResolvedUmrahState(rawState),
+    }
+  } catch (err) {
+    console.error('[ai auto-reply] unified Umrah understanding failed:', err)
+    return null
+  }
+}
+
+async function answerUmrahQuestionWithAi(args: {
+  config: AiConfig
+  latestText: string
+  quote: UmrahQuoteResult
+}): Promise<string> {
+  const systemPrompt = [
+    'Answer the customer question about the CURRENT Umrah quotation.',
+    'Use only the supplied quote context. Do not invent prices, availability, hotels, inclusions, or policies.',
+    'Keep the answer concise and WhatsApp-friendly. Do not repeat the entire quotation unless asked.',
+    `Quote context: ${JSON.stringify(umrahQuoteContext(args.quote))}`,
+  ].join('\n')
+  try {
+    const result = await generateReply({
+      config: args.config,
+      systemPrompt,
+      messages: [{ role: 'user', content: args.latestText }],
+    })
+    return result.text?.trim() || `Current estimated package total is ${args.quote.priceText}.`
+  } catch {
+    return `Current estimated package total is ${args.quote.priceText}.`
+  }
+}
+
+function formatUpdateReplyFromChangedFields(args: {
+  changedFields: string[]
+  quote: UmrahQuoteResult
+  budget: number | null
+}): string {
+  const { changedFields, quote, budget } = args
+  const fields = new Set(changedFields)
+  const makkah = quote.hotelLines.find((line) => /makkah/i.test(line.city))
+  const madina = quote.hotelLines.find((line) => /madina|madinah/i.test(line.city))
+  const lines: string[] = []
+
+  if (fields.has('duration')) {
+    lines.push(`Done — I’ve updated the trip duration to ${quote.nights} hotel nights.`)
+    if (makkah || madina) lines.push([makkah ? `Makkah: ${makkah.nights} nights` : '', madina ? `Madina: ${madina.nights} nights` : ''].filter(Boolean).join(' | '))
+  } else if (fields.has('travelDate')) {
+    lines.push(`Done — I’ve updated the travel date to ${quote.startDate}.`)
+  } else if (fields.has('adults') || fields.has('children') || fields.has('infants')) {
+    lines.push(`Done — I’ve updated the passenger details to ${quote.travelers} traveler${quote.travelers === 1 ? '' : 's'}.`)
+    lines.push(`Room setup: ${quote.rooms} x ${quote.roomType}.`)
+  } else if (fields.has('rooms') || fields.has('roomType')) {
+    lines.push(`Done — I’ve updated the room setup to ${quote.rooms} x ${quote.roomType}.`)
+  } else if (fields.has('hotelCategory')) {
+    lines.push(`Done — I’ve updated the hotel category to ${quote.packageCategory}.`)
+    if (makkah) lines.push(`Makkah: ${makkah.hotel}.`)
+    if (madina) lines.push(`Madina: ${madina.hotel}.`)
+  } else if (fields.has('makkahHotelQuery') || fields.has('madinahHotelQuery')) {
+    lines.push('Done — I’ve updated the hotel selection.')
+    if (makkah) lines.push(`Makkah: ${makkah.hotel}.`)
+    if (madina) lines.push(`Madina: ${madina.hotel}.`)
+  } else if (fields.has('includeTransport') || fields.has('vehicle')) {
+    lines.push(quote.transportSectors.length ? `Done — transport is now set to ${quote.vehicle}.` : 'Done — I’ve removed transport from the package.')
+  } else if (fields.has('ziyarat') || fields.has('selectedZiyarats')) {
+    lines.push(quote.ziyarats.length ? `Done — Ziyarat is now: ${quote.ziyarats.map((item) => item.name).join(', ')}.` : 'Done — I’ve removed Ziyarat from the package.')
+  } else if (fields.has('budget')) {
+    lines.push('Done — I’ve updated your budget and recalculated the package.')
+  } else {
+    lines.push('Done — I’ve updated your Umrah package.')
+  }
+
+  lines.push(`Updated estimated total: ${quote.priceText}.`)
+  if (budget !== null && budget < quote.total) {
+    lines.push(`Your budget is PKR ${budget.toLocaleString('en-PK')}, so the package is above budget by PKR ${Math.round(quote.total - budget).toLocaleString('en-PK')}.`)
+  }
+  lines.push('I’ve attached the updated quotation PDF.')
+  return lines.join('\n')
+}
+
 async function buildAiUmrahReply(args: {
   db: AdminClient
   accountId: string
@@ -1444,195 +1671,84 @@ async function buildAiUmrahReply(args: {
   const isUmrah = /\bumrah\b/i.test(conversationText(args.messages))
   if (!isUmrah) return null
 
+  const understanding = await understandUmrahConversationWithAi({
+    config: args.config,
+    messages: args.messages,
+    latestText: args.latestText,
+  })
+  if (!understanding) {
+    console.error('[ai auto-reply] unified Umrah understanding returned no usable result')
+    return null
+  }
+
+  const details = understanding.details
+  const missing = missingUmrahFields(details)
   const alreadyAsked = args.messages.some((message) =>
     message.role === 'assistant' && message.content.includes('customized Umrah package'),
   )
-  const details = mergeUmrahDetails(
-    parseUmrahDetails(args.messages),
-    await extractUmrahDetailsWithAi(args.config, args.messages),
-  )
-  const missing = missingUmrahFields(details)
-  const invalidDateMessage = invalidLatestUmrahDateMessage(args.latestText)
-  if (invalidDateMessage) {
-    await upsertAiUmrahLead({ ...args, details })
-    return invalidDateMessage
-  }
-  const wantsHotelChange = /\bchange\b.*\bhotel\b|\bhotel\b.*\bchange\b/i.test(args.latestText)
-  if (wantsHotelChange && !/\b(al\s+|hotel|tower|towers|makkah|madina|madinah)\b.{0,80}\b(to|as|with)\b/i.test(args.latestText)) {
-    await upsertAiUmrahLead({ ...args, details })
-    return [
-      'Sure. Please tell me which hotel you want to change.',
-      '',
-      'Example:',
-      'Makkah hotel: hotel name or preferred area',
-      'Madina hotel: hotel name or preferred area',
-      '',
-      'If you only want to change the category, reply with Economy / Standard / Executive.',
-    ].join('\n')
-  }
 
+  if (understanding.intent === 'greeting') {
+    return 'Wa Alaikum Assalam! How can I help you with your Umrah package?'
+  }
+  if (understanding.intent === 'handoff') {
+    await upsertAiUmrahLead({ ...args, details })
+    return null
+  }
   if (!alreadyAsked && missing.length > 0) {
     await upsertAiUmrahLead({ ...args, details })
     return UMRAH_INTAKE_MESSAGE
   }
-
   if (missing.length > 0) {
     await upsertAiUmrahLead({ ...args, details })
-    if (alreadyAsked && !likelyUsefulUmrahAnswer(args.latestText)) {
-      return formatInvalidUmrahAnswerPrompt(missing)
-    }
     return formatMissingUmrahPrompt(missing)
   }
 
   try {
     const plannerData = await loadUmrahPlannerDataForAccount(args.db, args.accountId)
-    const { quote, vehicle: currentVehicle } = buildCurrentUmrahQuote(details, plannerData)
-    const pdfRequested = wantsUmrahPdf(args.latestText)
-    const explicitBookingIntent = /\b(book it|confirm|proceed|go ahead|reserve|final|great book)\b/i.test(args.latestText)
-    const deterministicPackageUpdate = isUmrahPackageUpdate(args.latestText) && !isInformationalQuestion(args.latestText) && !explicitBookingIntent && !pdfRequested
+    const { quote } = buildCurrentUmrahQuote(details, plannerData)
+    const budget = budgetAmount(details.budget)
+    const hasPreviousQuote = args.messages.some((message) =>
+      message.role === 'assistant' && /Tours in Pakistan Umrah quotation/i.test(message.content),
+    )
 
-    if (pdfRequested) {
+    if (understanding.intent === 'send_pdf') {
       await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
       return {
         text: 'Sure — here is your current Umrah quotation PDF.',
         document: await uploadUmrahQuotePdf({ db: args.db, accountId: args.accountId, quote }) ?? undefined,
       }
     }
-
-    const aiDecision = await decideAiUmrahAction({
-      db: args.db,
-      accountId: args.accountId,
-      config: args.config,
-      latestText: args.latestText,
-      messages: args.messages,
-      details,
-      quote,
-    })
-
-    if (aiDecision?.action === 'handoff' && !deterministicPackageUpdate) {
-      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
-      return null
-    }
-
-    if (aiDecision?.action === 'booking_follow_up' && !deterministicPackageUpdate) {
-      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
-      return aiDecision.answer || [
-        'Great, I have marked this Umrah package for booking follow-up.',
-        `Current package total: ${quote.priceText}.`,
-        'Our team will confirm hotel availability, payment details, and required documents before final booking.',
-      ].join('\n')
-    }
-
-    if (aiDecision?.action === 'answer_question' && aiDecision.answer && !deterministicPackageUpdate) {
-      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
-      return aiDecision.answer
-    }
-
-    if (explicitBookingIntent) {
+    if (understanding.intent === 'show_itinerary') {
       await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
       return [
-        'Great, I have marked this Umrah package for booking follow-up.',
-        `Current package total: ${quote.priceText}`,
-        'Our team will confirm hotel availability, payment details, and required documents before final booking.',
-      ].join('\n')
-    }
-
-    if (/\bvisa\b/i.test(args.latestText) && /\b(fee|fees|price|cost|charges|tell|about)\b/i.test(args.latestText)) {
-      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
-      return [
-        `Visa fee included in this quotation: PKR ${Math.round(quote.visaTotal).toLocaleString('en-PK')}.`,
-        `This is calculated for ${quote.visaTravelers} traveler${quote.visaTravelers === 1 ? '' : 's'}.`,
-        'Final visa charges can vary if supplier or government fees change before booking.',
-      ].join('\n')
-    }
-
-    if (/\bziyarat/i.test(args.latestText) && /\b(available|option|options|include|tell|what|which|\?)/i.test(args.latestText)) {
-      await upsertAiUmrahLead({ ...args, details })
-      return availableUmrahZiyaratsText(plannerData)
-    }
-
-    if (/\b(category|categories|hotel type|hotel types)\b/i.test(args.latestText) && /\b(what|which|other|available|options|\?)/i.test(args.latestText)) {
-      await upsertAiUmrahLead({ ...args, details })
-      return umrahHotelCategoriesText()
-    }
-
-    if (/\b(lower|cheaper|cheap|lowest|less rate|low rate|reduce price|reduce rate)\b/i.test(args.latestText) && /\b(hotel|package|rate|price)\b/i.test(args.latestText)) {
-      const lowerDetails = { ...details, hotelCategory: 'Economy', hotelPreference: 'cheapest' as const }
-      const lowerQuote = buildCurrentUmrahQuote(lowerDetails, plannerData, {
-        hotelCategory: 'Economy',
-        hotelPreference: 'cheapest',
-      }).quote
-      const reply = [
-        'I checked the lower-rate available hotel option for these dates.',
+        `Here is your ${quote.nights}-night Umrah itinerary:`,
         '',
-        lowerQuote.whatsappText,
-      ].join('\n')
-      await upsertAiUmrahLead({ ...args, details: lowerDetails, quoteText: reply })
-      return {
-        text: reply,
-        document: await uploadUmrahQuotePdf({ db: args.db, accountId: args.accountId, quote: lowerQuote }) ?? undefined,
-      }
-    }
-
-    if (
-      /\b(?:1|one|single|per)\s*(?:person|adult|traveller|traveler|pax)\s*(?:price|rate|cost|charges?)?\b/i.test(args.latestText) ||
-      /\b(?:price|rate|cost|charges?)\s*(?:for|of|per)\s*(?:1|one|single|per)\s*(?:person|adult|traveller|traveler|pax)\b/i.test(args.latestText) ||
-      /\bper\s*(?:person|adult|traveller|traveler|pax)\b/i.test(args.latestText)
-    ) {
-      const perPerson = Math.ceil(quote.total / Math.max(1, quote.travelers))
-      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
-      return [
-        `Approx per person price is PKR ${perPerson.toLocaleString('en-PK')}.`,
-        `Total package: ${quote.priceText} for ${quote.travelers} traveler${quote.travelers === 1 ? '' : 's'}.`,
-        'This is an estimate based on the selected hotels, transport, visa, and current live package data.',
-      ].join('\n')
-    }
-
-    if (
-      /\b(rate|price|total|quote|quotation|package)\b.{0,80}\b(include|included|includes|for|cover|covers)\b.{0,80}\b(all|people|persons|adults|travellers|travelers|pax)\b/i.test(args.latestText) ||
-      /\b(include|included|includes|cover|covers)\b.{0,80}\b(all|people|persons|adults|travellers|travelers|pax)\b/i.test(args.latestText)
-    ) {
-      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
-      return [
-        `Yes, this estimated total is for ${quote.travelers} traveler${quote.travelers === 1 ? '' : 's'}.`,
-        `It is calculated for ${quote.rooms} x ${quote.roomType} room, ${quote.vehicle} transport, visa, and the selected hotels shown in the quotation.`,
-        quote.ziyarats.length
-          ? `Ziyarat included: ${quote.ziyarats.map((item) => item.name).join(', ')}.`
-          : 'Ziyarat is not included in this quotation.',
+        ...quote.itinerary.flatMap((item) => [item.title, ...item.details.map((detail) => `- ${detail}`), '']),
+        quote.transportSectors.length ? `Transport: ${quote.transportSectors.map((sector) => sector.label).join(', ')}.` : 'Transport: Not included.',
         `Estimated total: ${quote.priceText}.`,
+      ].join('\n').trim()
+    }
+    if (understanding.intent === 'booking') {
+      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+      return [
+        'Thank you. I’ve noted that you want to proceed with this Umrah package.',
+        `Current estimated total: ${quote.priceText}.`,
+        'Our team will confirm live hotel availability, payment details, and required documents before final booking.',
       ].join('\n')
     }
-
-    if (/\b(which|what).{0,40}\b(vehicle|transport|car)\b|\b(vehicle|transport).{0,40}\bwith us\b/i.test(args.latestText)) {
-      const options = availableUmrahVehicles(plannerData)
-      await upsertAiUmrahLead({ ...args, details })
-      return [
-        `Your current package is calculated with ${currentVehicle}.`,
-        options.length ? `Available vehicle options: ${options.join(', ')}.` : null,
-        'If you want to change it, reply for example: Change vehicle to Hiace.',
-      ].filter(Boolean).join('\n')
+    if (understanding.intent === 'question') {
+      const answer = await answerUmrahQuestionWithAi({ config: args.config, latestText: args.latestText, quote })
+      await upsertAiUmrahLead({ ...args, details, quoteText: quote.whatsappText })
+      return answer
     }
 
-    if (/\b(available hotels|which hotels|hotel options|show hotels|list hotels)\b/i.test(args.latestText)) {
-      await upsertAiUmrahLead({ ...args, details })
-      return availableUmrahHotelsText(plannerData, details.hotelCategory ?? 'Economy')
+    const shouldSendQuote = ['provide_details', 'update_package', 'send_quote', 'start_umrah'].includes(understanding.intent)
+    if (!shouldSendQuote) {
+      return await answerUmrahQuestionWithAi({ config: args.config, latestText: args.latestText, quote })
     }
 
-    if (isInformationalQuestion(args.latestText) && !isUmrahPackageUpdate(args.latestText)) {
-      await upsertAiUmrahLead({ ...args, details })
-      return null
-    }
-
-    const budget = budgetAmount(details.budget)
-    const hasPreviousQuote = args.messages.some((message) =>
-      message.role === 'assistant' && /Tours in Pakistan Umrah quotation/i.test(message.content),
-    )
-
-    // First completed request gets the full quotation. Later package changes get a
-    // short, contextual WhatsApp response matching exactly what the customer changed;
-    // the full recalculated details remain in the attached PDF.
-    const quoteText = hasPreviousQuote
-      ? formatUmrahPackageUpdateReply({ latestText: args.latestText, quote, budget })
+    const quoteText = hasPreviousQuote && understanding.intent === 'update_package'
+      ? formatUpdateReplyFromChangedFields({ changedFields: understanding.changedFields, quote, budget })
       : budget !== null && budget < quote.total
         ? [
             'I’ve prepared your Umrah quotation according to the details you shared.',
