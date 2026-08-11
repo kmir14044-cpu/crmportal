@@ -125,6 +125,7 @@ type UmrahIntent =
   | 'show_itinerary'
   | 'booking'
   | 'question'
+  | 'general'
   | 'handoff'
 
 interface UmrahAiUnderstanding {
@@ -1554,10 +1555,15 @@ async function loadPersistedAiUmrahSession(args: {
       : null
 
   if (savedAiState) {
-    return {
-      details: normalizeResolvedUmrahState(savedAiState),
-      quote: result,
+    const details = normalizeResolvedUmrahState(savedAiState)
+    if (result?.hotelLines?.length) {
+      const makkah = result.hotelLines.find((line) => /makkah/i.test(line.city))
+      const madinah = result.hotelLines.find((line) => /madina|madinah/i.test(line.city))
+      if (details.makkahNights == null && makkah?.nights != null) details.makkahNights = makkah.nights
+      if (details.madinahNights == null && madinah?.nights != null) details.madinahNights = madinah.nights
+      if (details.days == null && result.nights != null) details.days = result.nights
     }
+    return { details, quote: result }
   }
 
   // Backward-compatible restoration for sessions originally created by
@@ -1635,6 +1641,14 @@ function mergePersistedUmrahDetails(
     if (!changed.has('madinahNights')) merged.madinahNights = null
   }
 
+  // City-night edits are business-state changes, not just wording changes.
+  // Once both city counts are known, total hotel nights must equal their sum.
+  if (changed.has('makkahNights') || changed.has('madinahNights')) {
+    if (merged.makkahNights != null && merged.madinahNights != null) {
+      merged.days = merged.makkahNights + merged.madinahNights
+    }
+  }
+
   return merged
 }
 
@@ -1682,6 +1696,9 @@ async function savePersistedAiUmrahSession(args: {
     // resume after the chat context has been trimmed or many hours have passed.
     ai_state: {
       ...args.details,
+      makkahNights: args.details.makkahNights ?? args.quote.hotelLines.find((line) => /makkah/i.test(line.city))?.nights ?? null,
+      madinahNights: args.details.madinahNights ?? args.quote.hotelLines.find((line) => /madina|madinah/i.test(line.city))?.nights ?? null,
+      days: args.quote.nights,
       routeSequence: args.details.routeSequence ?? args.quote.routeSequence,
     },
   }
@@ -1812,12 +1829,16 @@ async function understandUmrahConversationWithAi(args: {
     'Supported standard route sequences: ["Makkah","Madinah"], ["Madinah","Makkah"], ["Makkah","Madinah","Makkah"], ["Madinah","Makkah","Madinah"].',
     'Examples: "pehle madina phir makkah" => ["Madinah","Makkah"]; "makkah phir madina phir makkah" => ["Makkah","Madinah","Makkah"].',
     'A route change is NOT a hotel change. If the latest customer message changes city order, changedFields must include routeSequence.',
+    'Relative city-night changes must be resolved against the persisted state. Example: if Madinah is currently 4 nights and customer says add one more night in Madinah, return madinahNights 5 and increase total duration to 10 nights; changedFields must include madinahNights and duration.',
+    'If the customer says remove one night from Makkah/Madinah, reduce that city by one and reduce total nights by one. Never leave total duration unchanged when a city-night count changes.',
     '',
-    'Intent must be exactly one of: greeting, start_umrah, provide_details, update_package, send_quote, send_pdf, show_itinerary, booking, question, handoff.',
+    'Intent must be exactly one of: greeting, start_umrah, provide_details, update_package, send_quote, send_pdf, show_itinerary, booking, question, general, handoff.',
     'send_pdf includes misspellings like send me pd/pfd/pdf file.',
     'show_itinerary means the user asks to see itinerary/details/schedule without changing the package.',
     'booking means they clearly want to book/confirm/proceed.',
-    'question means they ask about the current quote/package and are not changing it.',
+    'question means they ask specifically about the CURRENT Umrah quote/package and are not changing it.',
+    'general means ordinary conversation or a non-quote question: company/office/service questions, general travel questions, translation requests, praise, complaints, thanks, small talk, or unrelated help. An active Umrah session does NOT make every message an Umrah question.',
+    'Do not classify "sounds good", "thank you", praise, or acknowledgement as booking unless the customer explicitly asks to book/proceed/confirm.',
     'update_package means they changed one or more package fields.',
     'provide_details means they are supplying missing package fields before a first completed quote.',
     'changedFields must contain only fields changed by the LATEST customer message, such as travelDate,duration,adults,rooms,roomType,hotelCategory,vehicle,includeTransport,makkahHotelQuery,madinahHotelQuery,budget,ziyarat,selectedZiyarats,routeSequence.',
@@ -1836,7 +1857,7 @@ async function understandUmrahConversationWithAi(args: {
     const json = extractJsonObject(result.text)
     if (!json) return null
     const intent = String(json.intent ?? '') as UmrahIntent
-    const allowed: UmrahIntent[] = ['greeting','start_umrah','provide_details','update_package','send_quote','send_pdf','show_itinerary','booking','question','handoff']
+    const allowed: UmrahIntent[] = ['greeting','start_umrah','provide_details','update_package','send_quote','send_pdf','show_itinerary','booking','question','general','handoff']
     if (!allowed.includes(intent)) return null
     const rawState = json.state && typeof json.state === 'object' && !Array.isArray(json.state)
       ? json.state as Record<string, unknown>
@@ -1959,8 +1980,11 @@ async function generateNaturalRagReply(args: {
     'Reply naturally in the same general language/style as the customer.',
     'If the customer gives an Islamic greeting, respond with the culturally appropriate return greeting.',
     'If the customer says hi/hello/hey or another ordinary greeting, respond with an ordinary friendly greeting instead.',
-    'Answer only the current intent. Do not unnecessarily repeat an Umrah quotation.',
-    'Use the retrieved knowledge for company, destination, office, service, policy, and general travel questions.',
+    'Answer only the latest customer intent. Do not answer an older message just because it appears in recent history.',
+    'Do not mention, summarize, or sell the active Umrah package unless the latest customer message actually asks about that package.',
+    'For translation requests such as "I need this in English", translate the immediately preceding relevant assistant answer; do not replace it with the Umrah quotation.',
+    'For praise, thanks, complaints, insults, or small talk, respond briefly and naturally without adding package details.',
+    'Use the retrieved knowledge for company, destination, office, service, policy, visa/travel guidance, and general travel questions.',
     'Never invent company facts, prices, availability, package inclusions, or booking confirmation.',
     args.activeUmrahState
       ? `An active Umrah package exists. Current saved package state: ${JSON.stringify(args.activeUmrahState)}`
@@ -2026,7 +2050,7 @@ async function buildAiUmrahReply(args: {
     message.role === 'assistant' && message.content.includes('customized Umrah package'),
   )
 
-  if (understanding.intent === 'greeting') {
+  if (understanding.intent === 'greeting' || understanding.intent === 'general') {
     return await generateNaturalRagReply({
       db: args.db,
       accountId: args.accountId,
@@ -2347,6 +2371,35 @@ async function captureAiTravelLead(args: {
  * reacting to a customer message that just landed — so no separate
  * window check is needed.
  */
+
+function sanitizeWhatsAppText(text: string): string {
+  return text
+    .replace(/\*\*(.*?)\*\*/g, '*$1*')
+    .replace(/__(.*?)__/g, '*$1*')
+    .replace(/^#{1,6}\s+/gm, '')
+    .trim()
+}
+
+async function isStillLatestCustomerMessage(args: {
+  db: AdminClient
+  conversationId: string
+  latestText: string
+}): Promise<boolean> {
+  const { data, error } = await args.db
+    .from('messages')
+    .select('content_text')
+    .eq('conversation_id', args.conversationId)
+    .eq('sender_type', 'customer')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle()
+  if (error) {
+    console.error('[ai auto-reply] latest-message guard failed:', error)
+    return true
+  }
+  return String(data?.content_text ?? '').trim() === args.latestText.trim()
+}
+
 export async function dispatchInboundToAiReply(
   args: DispatchArgs,
 ): Promise<void> {
@@ -2421,12 +2474,16 @@ export async function dispatchInboundToAiReply(
       }
       if (claimed !== true) return
       const replyText = typeof umrahReply === 'string' ? umrahReply : umrahReply.text
+      if (!(await isStillLatestCustomerMessage({ db, conversationId, latestText }))) {
+        console.log('[ai auto-reply] skipped stale Umrah reply because a newer customer message arrived')
+        return
+      }
       await engineSendText({
         accountId,
         userId: configOwnerUserId,
         conversationId,
         contactId,
-        text: replyText,
+        text: sanitizeWhatsAppText(replyText),
       })
       const document = typeof umrahReply === 'string' ? null : umrahReply.document
       if (document) {
@@ -2521,12 +2578,16 @@ export async function dispatchInboundToAiReply(
       messages,
     })
 
+    if (!(await isStillLatestCustomerMessage({ db, conversationId, latestText }))) {
+      console.log('[ai auto-reply] skipped stale generic reply because a newer customer message arrived')
+      return
+    }
     await engineSendText({
       accountId,
       userId: configOwnerUserId,
       conversationId,
       contactId,
-      text,
+      text: sanitizeWhatsAppText(text),
     })
   } catch (err) {
     console.error('[ai auto-reply] dispatch failed:', err)
